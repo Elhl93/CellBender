@@ -10,7 +10,8 @@ from pyro.util import ignore_jit_warnings
 from cellbender.remove_background.model import RemoveBackgroundPyroModel
 from cellbender.remove_background.vae.decoder import Decoder
 from cellbender.remove_background.vae.encoder \
-    import EncodeZ, EncodeD, EncodeNonEmptyDropletLogitProb, CompositeEncoder
+    import EncodeZ, EncodeD, EncodeNonEmptyDropletLogitProb, \
+    EncodeAlpha0, CompositeEncoder
 from cellbender.remove_background.data.dataset import SingleCellRNACountsDataset
 from cellbender.remove_background.data.dataprep import \
     prep_sparse_data_for_training as prep_data_for_training
@@ -185,6 +186,9 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
                         output_dim=args.z_dim,
                         input_transform='normalize')
 
+    encoder_alpha0 = EncodeAlpha0(input_dim=count_matrix.shape[1],
+                                  hidden_dims=args.alpha_hidden_dims)
+
     encoder_d = EncodeD(input_dim=count_matrix.shape[1],
                         hidden_dims=args.d_hidden_dims,
                         output_dim=1,
@@ -194,7 +198,9 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
     if args.model == "simple":
 
         # If using the simple model, there is no need for p.
-        encoder = CompositeEncoder({'z': encoder_z, 'd_loc': encoder_d})
+        encoder = CompositeEncoder({'z': encoder_z,
+                                    'alpha0': encoder_alpha0,
+                                    'd_loc': encoder_d})
 
     else:
 
@@ -206,6 +212,7 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
             input_transform='normalize',
             log_count_crossover=dataset_obj.priors['log_counts_crossover'])
         encoder = CompositeEncoder({'z': encoder_z,
+                                    'alpha0': encoder_alpha0,
                                     'd_loc': encoder_d,
                                     'p_y': encoder_p})
 

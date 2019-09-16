@@ -2,14 +2,21 @@
 
 import numpy as np
 import scipy.sparse as sp
+
 import torch
 import torch.nn as nn
 from torch.distributions import constraints
+
 import pyro
 import pyro.distributions as dist
 from pyro.infer import config_enumerate
+import pyro.poutine as poutine
+
 from cellbender.remove_background.vae import encoder as encoder_module
 import cellbender.remove_background.consts as consts
+from cellbender.remove_background.distributions.NegativeBinomialPoissonSumSparse \
+    import NegativeBinomialPoissonSumSparse as NBPSS
+from cellbender.remove_background.distributions.NullDist import NullDist
 
 from typing import Union, Tuple
 from numbers import Number
@@ -25,16 +32,6 @@ class RemoveBackgroundPyroModel(nn.Module):
         encoder: An instance of an encoder object.  Can be a CompositeEncoder.
         decoder: An instance of a decoder object.
         dataset_obj: Dataset object which contains relevant priors.
-        phi_loc_prior: Location parameter for the prior of a Gamma distribution
-            for the overdispersion, Phi, of the negative binomial distribution
-            used for sampling counts.
-        phi_scale_prior: Location parameter for the prior of a Gamma
-            distribution for the overdispersion, Phi, of the negative binomial
-            distribution used for sampling counts.
-        rho_alpha_prior: Alpha parameter for Beta distribution of the
-            contamination parameter, rho.
-        rho_beta_prior: Beta parameter for Beta distribution of the
-            contamination parameter, rho.
         use_cuda: Will use GPU if True.
 
     Attributes:
@@ -48,10 +45,6 @@ class RemoveBackgroundPyroModel(nn.Module):
                  encoder: Union[nn.Module, encoder_module.CompositeEncoder],
                  decoder: nn.Module,
                  dataset_obj: 'SingleCellRNACountsDataset',
-                 phi_loc_prior: float = 0.2,
-                 phi_scale_prior: float = 0.2,
-                 rho_alpha_prior: float = 3,
-                 rho_beta_prior: float = 80,
                  use_cuda: bool = False):
         super(RemoveBackgroundPyroModel, self).__init__()
 
@@ -59,9 +52,6 @@ class RemoveBackgroundPyroModel(nn.Module):
         self.include_empties = True
         if self.model_type == "simple":
             self.include_empties = False
-        self.include_rho = False
-        if (self.model_type == "full") or (self.model_type == "swapping"):
-            self.include_rho = True
 
         self.n_genes = dataset_obj.analyzed_gene_inds.size
         self.z_dim = decoder.input_dim
@@ -102,6 +92,11 @@ class RemoveBackgroundPyroModel(nn.Module):
         self.z_loc_prior = torch.zeros(torch.Size([self.z_dim])).to(self.device)
         self.z_scale_prior = torch.ones(torch.Size([self.z_dim]))\
             .to(self.device)
+        self.epsilon_prior = torch.tensor(1000.).to(self.device)
+        self.alpha0_loc_prior = (torch.tensor(consts.ALPHA0_PRIOR_LOC)
+                                 .float().to(self.device))
+        self.alpha0_scale_prior = (torch.tensor(consts.ALPHA0_PRIOR_SCALE)
+                                   .float().to(self.device))
 
         if self.model_type != "simple":
 
@@ -114,10 +109,6 @@ class RemoveBackgroundPyroModel(nn.Module):
             assert chi_ambient_sum == 1., f"Issue with prior: chi_ambient " \
                                           f"should sum to 1, but it sums to " \
                                           f"{chi_ambient_sum}"
-            chi_bar_sum = np.round(dataset_obj.priors['chi_bar'].sum().item(),
-                                       decimals=4)
-            assert chi_bar_sum == 1., f"Issue with prior: chi_bar should " \
-                                      f"sum to 1, but is {chi_bar_sum}"
 
             self.d_empty_loc_prior = (np.log1p(dataset_obj
                                                .priors['empty_counts'],
@@ -134,35 +125,19 @@ class RemoveBackgroundPyroModel(nn.Module):
 
             self.chi_ambient_init = dataset_obj.priors['chi_ambient']\
                 .to(self.device)
-            self.avg_gene_expression = dataset_obj.priors['chi_bar']\
-                .to(self.device)
+
+            self.empty_UMI_threshold = (torch.tensor(dataset_obj.empty_UMI_threshold)
+                                        .float().to(self.device))
 
         else:
 
             self.avg_gene_expression = None
 
-        self.phi_loc_prior = (phi_loc_prior
-                              * torch.ones(torch.Size([])).to(self.device))
-        self.phi_scale_prior = (phi_scale_prior
-                                * torch.ones(torch.Size([])).to(self.device))
-        self.phi_conc_prior = ((phi_loc_prior ** 2 / phi_scale_prior ** 2)
-                               * torch.ones(torch.Size([])).to(self.device))
-        self.phi_rate_prior = ((phi_loc_prior / phi_scale_prior ** 2)
-                               * torch.ones(torch.Size([])).to(self.device))
-
-        self.rho_alpha_prior = (rho_alpha_prior
-                                * torch.ones(torch.Size([])).to(self.device))
-        self.rho_beta_prior = (rho_beta_prior
-                               * torch.ones(torch.Size([])).to(self.device))
-
     def _calculate_mu(self,
                       chi: torch.Tensor,
                       d_cell: torch.Tensor,
-                      chi_ambient: Union[torch.Tensor, None] = None,
-                      d_empty: Union[torch.Tensor, None] = None,
-                      y: Union[torch.Tensor, None] = None,
-                      rho: Union[torch.Tensor, None] = None,
-                      chi_bar: Union[torch.Tensor, None] = None):
+                      epsilon: torch.Tensor,
+                      y: Union[torch.Tensor, None] = None):
         """Implement a calculation of mean expression based on the model."""
 
         if self.model_type == "simple":
@@ -176,7 +151,7 @@ class RemoveBackgroundPyroModel(nn.Module):
             prior.
 
             """
-            mu = d_cell.unsqueeze(-1) * chi
+            mu = epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1) * chi
 
         elif self.model_type == "ambient":
             """There is a global hyperparameter called chi_ambient.  This 
@@ -192,62 +167,11 @@ class RemoveBackgroundPyroModel(nn.Module):
             and is drawn from a Gamma distribution with the specified prior.
 
             """
-            mu = (y.unsqueeze(-1) * d_cell.unsqueeze(-1) * chi
-                  + d_empty.unsqueeze(-1) * chi_ambient.unsqueeze(0))
-
-        elif self.model_type == "full":
-            """There is a global hyperparameter called chi_ambient.  This 
-            parameter is the learned fractional gene expression vector for 
-            ambient RNA, which in this model could be a combination of 
-            cell-free RNA and the average of cellular RNA which has been 
-            erroneously barcode-swapped.  The model is that a latent variable 
-            z is drawn from a z_dim dimensional normal distribution.  This 
-            latent z is put through the decoder to generate a full vector of 
-            fractional gene expression, chi.  Counts are then drawn from a 
-            negative binomial distribution with mean
-            (1 - rho) * [y * d * chi + d_ambient * chi_ambient]
-            + rho * (y * d + d_ambient) * chi_average.  d is drawn from a
-            LogNormal distribution with the specified prior.  Phi is the
-            overdispersion of this negative binomial, and is drawn from a Gamma
-            distribution with the specified prior.  Rho is the contamination
-            fraction, or swapping / stealing fraction, i.e. the fraction of 
-            reads in the cell barcode that do not originate from that cell 
-            barcode's droplet.
-    
-            """
-            mu = ((1 - rho.unsqueeze(-1))
-                  * (y.unsqueeze(-1) * d_cell.unsqueeze(-1) * chi
-                     + d_empty.unsqueeze(-1) * chi_ambient.unsqueeze(0))
-                  + rho.unsqueeze(-1)
-                  * (y.unsqueeze(-1) * d_cell.unsqueeze(-1)
-                     + d_empty.unsqueeze(-1))
-                  * chi_bar)
-
-        elif self.model_type == "swapping":
-            """The parameter chi_average is the average of cellular RNA which 
-            has been erroneously barcode-swapped or otherwise mis-assigned to 
-            another barcode.  The model is that a latent variable z is drawn 
-            from a z_dim dimensional normal distribution.  This latent z is put 
-            through the decoder to generate a full vector of fractional gene 
-            expression, chi.  Counts are then drawn from a negative binomial 
-            distribution with mean
-            (1 - rho) * [y * d * chi] + (rho * y * d + d_ambient) * chi_average.
-            d is drawn from a LogNormal distribution with the specified prior.
-            Phi is the overdispersion of this negative binomial, and is drawn 
-            from a Gamma distribution with the specified prior.  Rho is the 
-            contamination fraction, or swapping / stealing fraction, i.e. the 
-            fraction of reads in the cell barcode that do not originate from 
-            that cell barcode's droplet.
-    
-            """
-            mu = ((1 - rho.unsqueeze(-1))
-                  * (y.unsqueeze(-1) * d_cell.unsqueeze(-1) * chi)
-                  + (rho.unsqueeze(-1)
-                     * y.unsqueeze(-1) * d_cell.unsqueeze(-1)
-                     + d_empty.unsqueeze(-1)) * chi_bar)
+            mu = (y.unsqueeze(-1) * epsilon.unsqueeze(-1)
+                  * d_cell.unsqueeze(-1) * chi)
 
         else:
-            raise NotImplementedError(f"model_type was set to {model_type}, "
+            raise NotImplementedError(f"model_type was set to {self.model_type}, "
                                       f"which is not implemented.")
 
         return mu
@@ -272,14 +196,6 @@ class RemoveBackgroundPyroModel(nn.Module):
         else:
             chi_ambient = None
 
-        # Sample phi from Gamma prior.
-        phi = pyro.sample("phi",
-                          dist.Gamma(self.phi_conc_prior,
-                                     self.phi_rate_prior))
-
-        # Add L1 regularization term to the loss based on decoder weights.
-        # self._regularize(x.size(0))
-
         # Happens in parallel for each data point (cell barcode) independently:
         with pyro.plate("data", x.size(0),
                         use_cuda=self.use_cuda, device=self.device):
@@ -293,27 +209,32 @@ class RemoveBackgroundPyroModel(nn.Module):
             # Decode the latent code z to get fractional gene expression, chi.
             chi = self.decoder.forward(z)
 
-            # Sample d_cell based on priors.
-            d_cell = pyro.sample("d_cell",
-                                 dist.LogNormal(self.d_cell_loc_prior,
-                                                self.d_cell_scale_prior)
+            # Sample alpha0 based on a prior.
+            alpha0 = pyro.sample("alpha0",
+                                 dist.LogNormal(loc=self.alpha0_loc_prior,
+                                                scale=self.alpha0_scale_prior)
                                  .expand_by([x.size(0)]))
 
-            # Sample swapping fraction rho.
-            if self.include_rho:
-                rho = pyro.sample("rho", dist.Beta(self.rho_alpha_prior,
-                                                   self.rho_beta_prior)
-                                  .expand_by([x.size(0)]))
-            else:
-                rho = None
+            # Sample d_cell based on priors.
+            d_cell = pyro.sample("d_cell",
+                                 dist.LogNormal(loc=self.d_cell_loc_prior,
+                                                scale=self.d_cell_scale_prior)
+                                 .expand_by([x.size(0)]))
+
+            # Sample epsilon based on priors.
+            epsilon = torch.ones_like(alpha0).clone()
+            # epsilon = pyro.sample("epsilon",
+            #                       dist.Gamma(concentration=self.epsilon_prior,
+            #                                  rate=self.epsilon_prior)
+            #                       .expand_by([x.size(0)]))
 
             # If modelling empty droplets:
             if self.include_empties:
 
                 # Sample d_empty based on priors.
                 d_empty = pyro.sample("d_empty",
-                                      dist.LogNormal(self.d_empty_loc_prior,
-                                                     self.d_empty_scale_prior)
+                                      dist.LogNormal(loc=self.d_empty_loc_prior,
+                                                     scale=self.d_empty_scale_prior)
                                       .expand_by([x.size(0)]))
 
                 # Sample y, the presence of a real cell, based on p_logit_prior.
@@ -325,25 +246,49 @@ class RemoveBackgroundPyroModel(nn.Module):
                 y = None
 
             # Calculate the mean gene expression counts (for each barcode).
-            mu = self._calculate_mu(chi, d_cell,
-                                    chi_ambient=chi_ambient,
-                                    d_empty=d_empty,
-                                    y=y,
-                                    rho=rho,
-                                    chi_bar=self.avg_gene_expression)
+            mu_cell = self._calculate_mu(chi=chi,
+                                         d_cell=d_cell,
+                                         epsilon=epsilon,
+                                         y=y)
 
-            # Sample actual gene expression, and compare with observed data.
+            lam = (epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1)
+                   * chi_ambient)
 
-            # Poisson:
-            # pyro.sample("obs", dist.Poisson(mu).independent(1),
-            #             obs=x.reshape(-1, self.n_genes))
+            # print(f'alpha range is [{alpha0.min():.0f}, '
+            #       f'{alpha0.mean():.0f}, {alpha0.max():.0f}]')
 
-            # Negative binomial:
-            r = 1. / phi
-            logit = torch.log(mu * phi)
-            pyro.sample("obs", dist.NegativeBinomial(total_count=r,
-                                                     logits=logit).to_event(1),
-                        obs=x.reshape(-1, self.n_genes))
+            # Sample gene expression from our Negative Binomial Poisson Sum
+            # distribution, and compare with observed data.
+            c = pyro.sample("obs",
+                            NBPSS(mu=mu_cell + 1e-10,
+                                  alpha=alpha0.unsqueeze(-1) * chi,
+                                  lam=lam + 1e-10,
+                                  max_poisson=100).to_event(1),
+                            obs=x.reshape(-1, self.n_genes))
+
+            # Additionally use the surely empty droplets for regularization,
+            # since we know these droplets by their UMI counts.
+            if self.include_empties:
+
+                counts = x.sum(dim=-1, keepdim=False)
+                surely_empty_mask = ((counts < self.empty_UMI_threshold)
+                                     .type(torch.BoolTensor).to(self.device))
+
+                with poutine.mask(mask=surely_empty_mask):
+
+                    # # Semi-supervision of ambient expression.
+                    # pyro.sample("obs_empty",
+                    #             dist.Poisson(rate=lam + 1e-10).to_event(1),
+                    #             obs=x.reshape(-1, self.n_genes))
+
+                    # Semi-supervision of cell probabilities.
+                    p_logit_posterior = pyro.sample("p_passback",
+                                                    NullDist(torch.zeros(1)
+                                                             .to(self.device))
+                                                    .expand_by([x.size(0)]))
+                    pyro.sample("obs_empty_y",
+                                dist.Bernoulli(logits=p_logit_posterior),
+                                obs=torch.zeros_like(y))
 
     @config_enumerate(default='parallel')
     def guide(self, x: torch.Tensor):
@@ -383,35 +328,11 @@ class RemoveBackgroundPyroModel(nn.Module):
                                      torch.ones(torch.Size([])).to(self.device),
                                      constraint=constraints.simplex)
 
-        # Initialize variational parameters for rho.
-        if self.include_rho:
-            rho_alpha = pyro.param("rho_alpha",
-                                   self.rho_alpha_prior *
-                                   torch.ones(torch.Size([])).to(self.device),
-                                   constraint=constraints.positive)
-            rho_beta = pyro.param("rho_beta",
-                                  self.rho_beta_prior *
-                                  torch.ones(torch.Size([])).to(self.device),
-                                  constraint=constraints.positive)
-
-        # Initialize variational parameters for phi.
-        phi_loc = pyro.param("phi_loc",
-                             self.phi_loc_prior *
-                             torch.ones(torch.Size([])).to(self.device),
-                             constraint=constraints.positive)
-        phi_scale = pyro.param("phi_scale",
-                               self.phi_scale_prior *
-                               torch.ones(torch.Size([])).to(self.device),
-                               constraint=constraints.positive)
-
-        # Sample phi from a Gamma distribution (after re-parameterization).
-        phi_conc = phi_loc.pow(2) / phi_scale.pow(2)
-        phi_rate = phi_loc / phi_scale.pow(2)
-        pyro.sample("phi", dist.Gamma(phi_conc, phi_rate))
-
         # Happens in parallel for each data point (cell barcode) independently:
         with pyro.plate("data", x.size(0),
                         use_cuda=self.use_cuda, device=self.device):
+
+            # TODO: epsilon inference
 
             # Encode the latent variables from the input gene expression counts.
             if self.include_empties:
@@ -420,50 +341,65 @@ class RemoveBackgroundPyroModel(nn.Module):
             else:
                 enc = self.encoder.forward(x=x, chi_ambient=None)
 
-            # Sample swapping fraction rho.
-            if self.include_rho:
-                pyro.sample("rho", dist.Beta(rho_alpha,
-                                             rho_beta).expand_by([x.size(0)]))
-
             # Code specific to models with empty droplets.
             if self.include_empties:
 
                 # Sample d_empty, which doesn't depend on y.
                 pyro.sample("d_empty",
-                            dist.LogNormal(d_empty_loc,
-                                           d_empty_scale)
+                            dist.LogNormal(loc=d_empty_loc,
+                                           scale=d_empty_scale)
                             .expand_by([x.size(0)]))
 
-                # Mask out the barcodes which are likely to be empty droplets.
-                masking = (enc['p_y'] >= 0).to(self.device, dtype=torch.float32)
-
-                # Sample latent code z for the barcodes containing real cells.
-                pyro.sample("z",
-                            dist.Normal(enc['z']['loc'],
-                                        enc['z']['scale'])
-                            .to_event(1).mask(masking))
+                # Pass back the inferred p_y to the model.
+                pyro.sample("p_passback", NullDist(enc['p_y']))
 
                 # Sample the Bernoulli y from encoded p(y).
-                pyro.sample("y", dist.Bernoulli(logits=enc['p_y']))
+                y = pyro.sample("y", dist.Bernoulli(logits=enc['p_y']))
+                cell_mask = y.type(torch.BoolTensor).to(self.device)
+
+                # Mask out empty droplets.
+                with poutine.mask(mask=cell_mask):
+
+                    # Sample latent code z for the barcodes containing cells.
+                    pyro.sample("z",
+                                dist.Normal(loc=enc['z']['loc'],
+                                            scale=enc['z']['scale'])
+                                .to_event(1))
+
+                    # Sample alpha0 for the barcodes containing cells.
+                    pyro.sample("alpha0",
+                                dist.LogNormal(loc=enc['alpha0']['loc'],
+                                               scale=0.1))
+                    # pyro.sample("alpha0",
+                    #             dist.LogNormal(loc=enc['alpha0']['loc'],
+                    #                            scale=enc['alpha0']['scale']))
 
                 # Gate d_cell_loc so empty droplets do not give big gradients.
                 prob = enc['p_y'].sigmoid()  # Logits to probability
                 d_cell_loc_gated = (prob * enc['d_loc'] + (1 - prob)
                                     * self.d_cell_loc_prior)
 
-                # Sample d based the encoding.
-                pyro.sample("d_cell", dist.LogNormal(d_cell_loc_gated,
-                                                     d_cell_scale))
+                # Sample d based on the encoding.
+                pyro.sample("d_cell", dist.LogNormal(loc=d_cell_loc_gated,
+                                                     scale=d_cell_scale))
 
             else:
 
-                # Sample d based the encoding.
-                pyro.sample("d_cell", dist.LogNormal(enc['d_loc'],
-                                                     d_cell_scale))
+                # Sample d based on the encoding.
+                pyro.sample("d_cell", dist.LogNormal(log=enc['d_loc'],
+                                                     scale=d_cell_scale))
 
                 # Sample latent code z for each cell.
-                pyro.sample("z", dist.Normal(enc['z']['loc'],
-                                             enc['z']['scale']).independent(1))
+                pyro.sample("z",
+                            dist.Normal(loc=enc['z']['loc'],
+                                        scale=enc['z']['scale'])
+                            .to_event(1))
+
+                # Sample alpha0 for the barcodes containing cells.
+                pyro.sample("alpha0",
+                            dist.LogNormal(loc=enc['alpha0']['loc'],
+                                           scale=enc['alpha0']['scale'])
+                            .to_event(1))
 
 
 def get_encodings(model: RemoveBackgroundPyroModel,
@@ -606,9 +542,6 @@ def generate_maximum_a_posteriori_count_matrix(
         z[p_no_nans < consts.CELL_PROB_CUTOFF, :] = 0.
         barcode_inds = np.arange(0, count_matrix.shape[0])  # All barcodes
 
-    # Get mean of the inferred posterior for the overdispersion, phi.
-    phi = to_ndarray(pyro.get_param_store().get_param("phi_loc")).item()
-
     # Get the gene expression vectors by sending latent z through the decoder.
     # Send dataset through the learned encoder in chunks.
     barcodes = []
@@ -669,7 +602,7 @@ def generate_maximum_a_posteriori_count_matrix(
     return inferred_count_matrix
 
 
-def get_ambient_expression_from_pyro_param_store() -> Union[np.ndarray, None]:
+def get_ambient_expression() -> Union[np.ndarray, None]:
     """Get ambient RNA expression for 'empty' droplets.
 
     Return:
@@ -691,58 +624,6 @@ def get_ambient_expression_from_pyro_param_store() -> Union[np.ndarray, None]:
         pass
 
     return chi_ambient
-
-
-def get_contamination_fraction() -> Union[np.ndarray, None]:
-    """Get barcode swapping contamination fraction hyperparameters.
-
-    Return:
-        rho: The alpha and beta parameters of the Beta distribution for the
-            contamination fraction.
-
-    Note:
-        Inference must have been performed on a model with 'rho_alpha' and
-        'rho_beta' hyperparameters prior to making this call.
-
-    """
-
-    rho = None
-
-    try:
-        # Get fit hyperparameters for contamination fraction from model.
-        rho_alpha = to_ndarray(pyro.param("rho_alpha")).squeeze()
-        rho_beta = to_ndarray(pyro.param("rho_beta")).squeeze()
-        rho = np.array([rho_alpha, rho_beta])
-    except KeyError:
-        pass
-
-    return rho
-
-
-def get_overdispersion_from_pyro_param_store() -> Union[np.ndarray, None]:
-    """Get overdispersion hyperparameters.
-
-    Return:
-        phi: The mean and stdev parameters of the Gamma distribution for the
-            contamination fraction.
-
-    Note:
-        Inference must have been performed on a model with 'phi_loc' and
-        'phi_scale' hyperparameters prior to making this call.
-
-    """
-
-    phi = None
-
-    try:
-        # Get fit hyperparameters for contamination fraction from model.
-        phi_loc = to_ndarray(pyro.param("phi_loc")).squeeze()
-        phi_scale = to_ndarray(pyro.param("phi_scale")).squeeze()
-        phi = np.array([phi_loc, phi_scale])
-    except KeyError:
-        pass
-
-    return phi
 
 
 def to_ndarray(x: Union[Number, np.ndarray, torch.Tensor]) -> np.ndarray:

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import cellbender.remove_background.consts as consts
 from typing import Dict, List, Union
 import warnings
 
@@ -103,6 +104,81 @@ class EncodeZ(nn.Module):
         # Compute the outputs: loc is any real number, scale must be positive.
         loc = self.loc_out(hidden)
         scale = torch.exp(self.sig_out(hidden))
+
+        return {'loc': loc.squeeze(), 'scale': scale.squeeze()}
+
+
+class EncodeAlpha0(nn.Module):
+    """Encoder module transforms gene expression into latent Dirichlet precision.
+
+    Input dimension is the total number of genes and the output dimension is
+    one.  This encoder transforms a point in high-dimensional gene expression
+    space to a single number, alpha0: the precision of a Dirichlet
+    distribution, where  the Dirichlet concentration parameters are
+    chi * alpha0.  The output is two numbers: one the mean, and one the
+    standard deviation, both in log space, both positive.
+
+    Args:
+        input_dim: Number of genes.  The size of the input of this encoder.
+        hidden_dims: Size of each of the hidden layers.
+
+    Attributes:
+        linears: torch.nn.ModuleList of fully-connected layers before the
+            output layer.
+        loc_out: torch.nn.Linear fully-connected output layer for the location
+            of each point in latent space.
+        sig_out: torch.nn.Linear fully-connected output layer for the standard
+            deviation of each point in latent space.  Must result in positive
+            values.
+
+    Note:
+        An encoder with two hidden layers with sizes 100 and 500, respectively,
+        should set hidden_dims = [100, 500].  An encoder with only one hidden
+        layer should still pass in hidden_dims as a list, for example,
+        hidden_dims = [500].
+
+    """
+
+    def __init__(self, input_dim: int, hidden_dims: List[int]):
+        super(EncodeAlpha0, self).__init__()
+        self.input_dim = input_dim
+
+        # Set up the linear transformations used in fully-connected layers.
+        self.linears = nn.ModuleList([nn.Linear(input_dim + 1, hidden_dims[0])])
+        for i in range(1, len(hidden_dims)):  # Second hidden layer onward
+            self.linears.append(nn.Linear(hidden_dims[i-1], hidden_dims[i]))
+        self.loc_out = nn.Linear(hidden_dims[-1], 1)
+        self.sig_out = nn.Linear(hidden_dims[-1], 1)
+
+        # Initialization of outputs.
+        self.initial_loc = None
+
+        # Set up the non-linear activations.
+        self.softplus = nn.Softplus()
+
+    def forward(self, x: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
+        # Define the forward computation to go from gene expression to latent
+        # representation.
+
+        # Shape the input.
+        x = x.reshape(-1, self.input_dim)
+
+        # Calculate the number of nonzero genes.
+        nnz = (x > 0).sum(dim=-1, keepdim=True).float()
+
+        # Compute the hidden layers.
+        hidden = self.softplus(self.linears[0](torch.cat((nnz, x), dim=-1)))
+        for i in range(1, len(self.linears)):  # Second hidden layer onward
+            hidden = self.softplus(self.linears[i](hidden))
+
+        # Compute the outputs: loc is any real number, scale must be positive.
+        loc = self.softplus(self.loc_out(hidden))
+        scale = torch.exp(self.sig_out(hidden))
+
+        # Initialize outputs to a given value.
+        if self.initial_loc is None:
+            self.initial_loc = loc.mean().item()
+        loc = loc - self.initial_loc + consts.ALPHA0_PRIOR_LOC
 
         return {'loc': loc.squeeze(), 'scale': scale.squeeze()}
 

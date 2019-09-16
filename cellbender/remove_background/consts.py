@@ -2,7 +2,7 @@
 
 # Factor by which the mode UMI count of the empty droplet plateau is
 # multiplied to come up with a UMI cutoff below which no barcodes are used.
-EMPIRICAL_LOW_UMI_TO_EMPTY_DROPLET_THRESHOLD = 0.8
+EMPIRICAL_LOW_UMI_TO_EMPTY_DROPLET_THRESHOLD = 0.5
 
 # Default prior for the standard deviation of the LogNormal distribution for
 # cell size, used only in the case of the 'simple' model.
@@ -28,3 +28,7 @@ DEFAULT_BATCH_SIZE = 128
 
 # Fraction of totally empty droplets that makes up each minibatch, by default.
 FRACTION_EMPTIES = 0.5
+
+# Prior mean and std in log space for alpha0, the Dirichlet precision for cells.
+ALPHA0_PRIOR_LOC = 7.
+ALPHA0_PRIOR_SCALE = 2.

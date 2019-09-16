@@ -54,20 +54,16 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                                 "analyzed. The largest 'total_droplets' "
                                 "droplets will have their cell "
                                 "probabilities inferred as an output.")
-    subparser.add_argument("--model", nargs=None, type=str, default="full",
-                           choices=["simple", "ambient",
-                                    "swapping", "full"],
+    subparser.add_argument("--model", nargs=None, type=str,
+                           default="ambient",
+                           choices=["simple", "ambient"],
                            dest="model",
                            help="Which model is being used for count data. "
-                                " 'simple' does not model either ambient "
-                                "RNA or random barcode swapping (for "
-                                "debugging purposes -- not recommended).  "
-                                "'ambient' assumes background RNA is "
-                                "incorporated into droplets.  'swapping' "
-                                "assumes background RNA comes from random "
-                                "barcode swapping.  'full' uses a "
-                                "combined ambient and swapping model.  "
-                                "Defaults to 'full'.")
+                                " 'simple' does not model ambient "
+                                "RNA (for debugging purposes -- not "
+                                "recommended).  'ambient' assumes background "
+                                "RNA is incorporated into droplets.  "
+                                "Defaults to 'ambient'.")
     subparser.add_argument("--epochs", nargs=None, type=int, default=150,
                            dest="epochs",
                            help="Number of epochs to train.")
@@ -91,6 +87,11 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                            dest="z_hidden_dims",
                            help="Dimension of hidden layers in the encoder "
                                 "for z.")
+    subparser.add_argument("--alpha-layers", nargs="+", type=int,
+                           default=[512, 128, 32],
+                           dest="alpha_hidden_dims",
+                           help="Dimension of hidden layers in the encoder "
+                                "for alpha, the Dirichlet precision.")
     subparser.add_argument("--d-layers", nargs="+", type=int,
                            default=[5, 2, 2],
                            dest="d_hidden_dims",

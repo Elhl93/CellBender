@@ -376,3 +376,82 @@ def neg_binom(mu: float, phi: float, size: int = 1) -> np.ndarray:
     n = 1. / phi
     p = n / (mu + n)
     return np.random.negative_binomial(n, p, size=size)
+
+
+def sample_from_dirichlet_model(num: int,
+                                alpha: np.ndarray,
+                                d_mu: float,
+                                d_sigma: float,
+                                v_mu: float,
+                                v_sigma: float,
+                                y: int,
+                                chi_ambient: np.ndarray,
+                                eps_param: float,
+                                random_seed: int = 0) -> Tuple[np.ndarray,
+                                                               np.ndarray]:
+    """Draw samples of cell expression profiles using the Dirichlet Poisson sum
+    model.
+
+    Args:
+        num: Number of expression profiles to draw.
+        alpha: Dirichlet concentration parameters for cell expression profile,
+            size (n_gene).
+        d_mu: Mean of LogNormal cell size distribution.
+        d_sigma: Scale parameter of LogNormal cell size distribution.
+        v_mu: Mean of LogNormal empty size distribution.
+        v_sigma: Scale parameter of LogNormal empty size distribution.
+        y: 1 for cell(s), 0 for empties.
+        chi_ambient: Ambient gene expression profile (sums to one).
+        eps_param: Parameter for gamma distribution of the epsilon droplet
+            efficiency factor ~ Gamma(eps_param, 1/eps_param), i.e. mean is 1.
+        random_seed: Seed a random number generator.
+
+    Returns:
+        Tuple of (c_real, c_bkg)
+        c_real: Count matrix (cells, genes) for real cell counts.
+        c_bkg: Count matrix (cells, genes) for background RNA.
+
+    """
+
+    # Check inputs.
+    assert y in [0, 1], f'y must be 0 or 1, but was {y}'
+    assert d_mu > 0, f'd_mu must be > 0, but was {d_mu}'
+    assert d_sigma > 0, f'd_sigma must be > 0, but was {d_sigma}'
+    assert v_mu > 0, f'v_mu must be > 0, but was {v_mu}'
+    assert v_sigma > 0, f'v_sigma must be > 0, but was {v_sigma}'
+    assert np.all(alpha > 0), 'all alphas must be > 0.'
+    assert np.all(chi_ambient > 0), 'all chi_ambient must be > 0.'
+    assert chi_ambient.sum() == 1., f'chi_ambient must sum to 1, but it sums ' \
+        f'to {chi_ambient.sum()}'
+    assert len(chi_ambient.shape) == 1, 'chi_ambient should be 1-dimensional.'
+    assert alpha.shape[0] == chi_ambient.size, 'alpha and chi_ambient must ' \
+        'be the same size in the rightmost dimension.'
+    assert num > 0, f'num must be > 0, but was {num}'
+    assert eps_param > 1, f'eps_param must be > 1, but was {eps_param}'
+
+    # Seed random number generator.
+    rng = np.random.RandomState(seed=random_seed)
+
+    # Draw chi ~ Dir(alpha)
+    chi = rng.dirichlet(alpha=alpha, size=num)
+
+    # Draw epsilon ~ Gamma(eps_param, 1 / eps_param)
+    epsilon = rng.gamma(shape=eps_param, scale=1. / eps_param, size=num)
+
+    # Draw d ~ LogNormal(d_mu, d_sigma)
+    d = rng.lognormal(mean=d_mu, sigma=d_sigma, size=num)
+
+    # Draw d ~ LogNormal(d_mu, d_sigma)
+    v = rng.lognormal(mean=v_mu, sigma=v_sigma, size=num)
+
+    # Draw cell counts ~ Poisson(y * epsilon * d * chi)
+    c_real = rng.poisson(lam=(y * epsilon * d * chi.transpose()).transpose(),
+                         size=(num, chi_ambient.size))
+
+    # Draw empty counts ~ Poisson(epsilon * v * chi_ambient)
+    c_bkg = rng.poisson(lam=(np.expand_dims(epsilon * v, axis=1)
+                             * chi_ambient),
+                        size=(num, chi_ambient.size))
+
+    # Output observed counts are the sum, but return them separately.
+    return c_real, c_bkg

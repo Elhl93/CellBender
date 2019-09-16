@@ -4,11 +4,14 @@ import tables
 import numpy as np
 import scipy.sparse as sp
 import scipy.io as io
-import cellbender.remove_background.model
-import cellbender.remove_background.consts as consts
+from scipy.stats import mode
 from sklearn.decomposition import PCA
 import torch
-from scipy.stats import mode
+
+import cellbender.remove_background.model
+import cellbender.remove_background.consts as consts
+from cellbender.remove_background.infer import ProbPosterior
+from cellbender.remove_background.data.dataprep import DataLoader
 
 from typing import Dict, List, Union, Tuple
 import logging
@@ -46,6 +49,8 @@ class SingleCellRNACountsDataset:
             trim_dataset_for_analysis().
         model_name: Name of model being run.
         priors: Priors estimated from the data useful for modelling.
+        empty_UMI_threshold: This UMI count is the maximum UMI count in the
+            user-defined surely empty droplets.
 
     Note: Count data is kept as the original, untransformed data.  Priors are
     in terms of the transformed count data.
@@ -303,11 +308,19 @@ class SingleCellRNACountsDataset:
             self.empty_barcode_inds = empty_droplet_barcodes\
                 .astype(dtype=int)
 
+            # Find the UMI threshold for surely empty droplets.
+            last_analyzed_bc = min(cell_barcodes.size + transition_barcodes.size,
+                                   umi_count_order.size)
+            self.empty_UMI_threshold = (umi_counts[umi_count_order]
+                                        [last_analyzed_bc])
+
             logging.info(f"Using {cell_barcodes.size} probable cell "
                          f"barcodes, plus an additional "
                          f"{transition_barcodes.size} barcodes, "
                          f"and {empty_droplet_barcodes.size} empty "
                          f"droplets.")
+            logging.info(f"Largest surely-empty droplet has "
+                         f"{self.empty_UMI_threshold} UMI counts.")
 
             if ((low_UMI_count_cutoff == self.low_count_threshold)
                     and (empty_droplet_barcodes.size == 0)):
@@ -411,6 +424,39 @@ class SingleCellRNACountsDataset:
                             "Could be slow.")
             return self.data['matrix']
 
+    def get_dataloader(self,
+                       use_cuda: bool = True,
+                       batch_size: int = 200,
+                       shuffle: bool = False,
+                       analyzed_bcs_only: bool = True) -> DataLoader:
+        """Return a dataloader for the count matrix.
+
+        Args:
+            use_cuda: Whether to load data into GPU memory.
+            batch_size: Size of minibatch of data yielded by dataloader.
+            shuffle: Whether dataloader should shuffle the data.
+            drop_last: Whether the dataloader should exclude the last batch of
+                data that has a different batch size.
+            analyzed_bcs_only: Only include the barcodes that have been
+                analyzed, not the surely empty droplets.
+
+        Returns:
+            data_loader: A dataloader that yields the entire dataset in batches.
+
+        """
+
+        if analyzed_bcs_only:
+            count_matrix = self.get_count_matrix()
+        else:
+            count_matrix = self.get_count_matrix_all_barcodes()
+
+        return DataLoader(count_matrix,
+                          empty_drop_dataset=None,
+                          batch_size=batch_size,
+                          fraction_empties=0.,
+                          shuffle=shuffle,
+                          use_cuda=use_cuda)
+
     def save_to_output_file(
             self,
             output_file: str,
@@ -441,19 +487,23 @@ class SingleCellRNACountsDataset:
 
         logging.info("Preparing to write outputs to file...")
 
-        # Calculate quantities of interest from the model.
+        # Create posterior.
+        self.posterior = ProbPosterior(self, inferred_model,
+                                       guide=inferred_model.guide,
+                                       counts_dtype=np.uint32)
+
         # Encoded values of latent variables.
-        z, d, p = cellbender.remove_background.model.get_encodings(
-            inferred_model, self, cells_only=True)
+        enc = self.posterior.encodings
+        z = enc['z']
+        d = enc['d']
+        p = enc['p']
+        alpha0 = enc['alpha0']
 
         # Estimate the ambient-background-subtracted UMI count matrix.
         if self.model_name != "simple":
 
-            inferred_count_matrix = cellbender.remove_background.model.\
-                generate_maximum_a_posteriori_count_matrix(z, d, p,
-                                                           inferred_model,
-                                                           self,
-                                                           cells_only=True)
+            inferred_count_matrix = self.posterior.mean
+
         else:
 
             # No need to generate a new count matrix for simple model.
@@ -462,18 +512,11 @@ class SingleCellRNACountsDataset:
 
         # Inferred ambient gene expression vector.
         ambient_expression_trimmed = cellbender.remove_background.model.\
-            get_ambient_expression_from_pyro_param_store()
+            get_ambient_expression()
 
         # Convert the indices from trimmed gene set to original gene indices.
         ambient_expression = np.zeros(self.data['matrix'].shape[1])
         ambient_expression[self.analyzed_gene_inds] = ambient_expression_trimmed
-
-        # Inferred contamination fraction hyperparameters.
-        rho = cellbender.remove_background.model.get_contamination_fraction()
-
-        # Inferred overdispersion hyperparameters.
-        phi = cellbender.remove_background.model.\
-            get_overdispersion_from_pyro_param_store()
 
         # Figure out the indices of barcodes that have cells.
         if p is not None:
@@ -494,9 +537,7 @@ class SingleCellRNACountsDataset:
             inferred_count_matrix=inferred_count_matrix,
             cell_barcode_inds=cell_barcode_inds,
             ambient_expression=ambient_expression,
-            rho=rho,
-            phi=phi,
-            z=z, d=d, p=p,
+            z=z, d=d, p=p, alpha=alpha0,
             loss=inferred_model.loss)
 
         # Generate filename for filtered matrix output.
@@ -519,11 +560,10 @@ class SingleCellRNACountsDataset:
                 inferred_count_matrix=inferred_count_matrix[cell_barcode_inds, :],
                 cell_barcode_inds=None,
                 ambient_expression=ambient_expression,
-                rho=rho,
-                phi=phi,
                 z=z[filtered_inds_of_analyzed_barcodes, :],
                 d=d[filtered_inds_of_analyzed_barcodes],
                 p=p[filtered_inds_of_analyzed_barcodes],
+                alpha=alpha0[filtered_inds_of_analyzed_barcodes],
                 loss=inferred_model.loss)
 
             # Save barcodes determined to contain cells as _cell_barcodes.csv
@@ -875,6 +915,7 @@ def write_matrix_to_cellranger_h5(
         z: Union[np.ndarray, None] = None,
         d: Union[np.ndarray, None] = None,
         p: Union[np.ndarray, None] = None,
+        alpha: Union[np.ndarray, None] = None,
         loss: Union[Dict, None] = None) -> bool:
     """Write count matrix data to output HDF5 file using CellRanger format.
 
@@ -891,8 +932,9 @@ def write_matrix_to_cellranger_h5(
         rho: Hyperparameters for the contamination fraction distribution.
         phi: Hyperparameters for the overdispersion distribution.
         z: Latent encoding of gene expression.
-        d: Latent encoding of cell size scale factor.
-        p: Latent encoding of the probability that a barcode contains a cell.
+        d: Latent cell size scale factor.
+        p: Latent probability that a barcode contains a cell.
+        alpha: Latent Dirichlet precision parameter for each cell.
         loss: Training and test error, as ELBO, for each epoch.
 
     Note:
@@ -947,10 +989,12 @@ def write_matrix_to_cellranger_h5(
                 f.create_array(group, "latent_scale", d)
             if p is not None:
                 f.create_array(group, "latent_cell_probability", p)
-            if rho is not None:
-                f.create_array(group, "contamination_fraction_params", rho)
-            if phi is not None:
-                f.create_array(group, "overdispersion_params", phi)
+            if alpha is not None:
+                f.create_array(group, "latent_dirichlet_precision", alpha)
+            # if rho is not None:
+            #     f.create_array(group, "contamination_fraction_params", rho)
+            # if phi is not None:
+            #     f.create_array(group, "overdispersion_params", phi)
             if loss is not None:
                 f.create_array(group, "training_elbo_per_epoch",
                                np.array(loss['train']['elbo']))

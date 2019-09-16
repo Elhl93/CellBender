@@ -74,6 +74,12 @@ class CLI(AbstractCLI):
                                  "significant speed-ups.\n\n")
                 sys.stdout.flush()  # Write immediately
 
+        # Ensure all network layer dimensions are positive.
+        for n in args.z_hidden_dims:
+            assert n > 0, "--z-layers must be all positive integers."
+        for n in args.alpha_hidden_dims:
+            assert n > 0, "--alpha-layers must be all positive integers."
+
         # Ensure that z_hidden_dims are in encoder order.
         # (The same dimensions are used in reverse order for the decoder.)
         args.z_hidden_dims = sorted(args.z_hidden_dims, reverse=True)
