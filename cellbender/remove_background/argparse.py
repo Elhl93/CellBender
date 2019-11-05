@@ -55,15 +55,19 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                                 "droplets will have their cell "
                                 "probabilities inferred as an output.")
     subparser.add_argument("--model", nargs=None, type=str,
-                           default="ambient",
-                           choices=["simple", "ambient"],
+                           default="full",
+                           choices=["simple", "ambient", "swapping", "full"],
                            dest="model",
                            help="Which model is being used for count data. "
-                                " 'simple' does not model ambient "
-                                "RNA (for debugging purposes -- not "
-                                "recommended).  'ambient' assumes background "
-                                "RNA is incorporated into droplets.  "
-                                "Defaults to 'ambient'.")
+                                " 'simple' does not model either ambient "
+                                "RNA or random barcode swapping (for "
+                                "debugging purposes -- not recommended).  "
+                                "'ambient' assumes background RNA is "
+                                "incorporated into droplets.  'swapping' "
+                                "assumes background RNA comes from random "
+                                "barcode swapping.  'full' uses a "
+                                "combined ambient and swapping model.  "
+                                "Defaults to 'full'.")
     subparser.add_argument("--epochs", nargs=None, type=int, default=150,
                            dest="epochs",
                            help="Number of epochs to train.")
@@ -117,6 +121,14 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                                 "entirely.  In the output count matrix, "
                                 "the counts for these genes will be set "
                                 "to zero.")
+    subparser.add_argument("--lambda", nargs=None,
+                           type=float, default=1.,
+                           dest="lambda_multiplier",
+                           help="Factor by which background estimate is "
+                                "multiplied prior to final background "
+                                "removal.  Must be positive.  More background "
+                                "removal is accompanied by more signal removal "
+                                "at high values of lambda.")
     subparser.add_argument("--learning-rate", nargs=None,
                            type=float, default=1e-3,
                            dest="learning_rate",

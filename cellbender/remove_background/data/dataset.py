@@ -35,6 +35,8 @@ class SingleCellRNACountsDataset:
         gene_blacklist: List of integer indices of genes to exclude entirely.
         low_count_threshold: Droplets with UMI counts below this number are
             excluded entirely from the analysis.
+        lambda_multiplier: Float that multiplies background estimate before
+            MAP estimation.
 
     Attributes:
         input_file: Name of data source file.
@@ -49,6 +51,7 @@ class SingleCellRNACountsDataset:
             trim_dataset_for_analysis().
         model_name: Name of model being run.
         priors: Priors estimated from the data useful for modelling.
+        posterior: Posterior estimated after inference.
         empty_UMI_threshold: This UMI count is the maximum UMI count in the
             user-defined surely empty droplets.
 
@@ -64,7 +67,8 @@ class SingleCellRNACountsDataset:
                  fraction_empties: float = 0.5,
                  model_name: str = None,
                  gene_blacklist: List[int] = [],
-                 low_count_threshold: int = 30):
+                 low_count_threshold: int = 30,
+                 lambda_multiplier: float = 1.):
         assert input_file is not None, "Attempting to load data, but no " \
                                        "input file was specified."
         self.input_file = input_file
@@ -76,7 +80,9 @@ class SingleCellRNACountsDataset:
         self.fraction_empties = fraction_empties
         self.is_trimmed = False
         self.low_count_threshold = low_count_threshold
-        self.priors = {'n_cells': expected_cell_count}
+        self.priors = {'n_cells': expected_cell_count}  # Expected cells could be None.
+        self.posterior = None
+        self.lambda_multiplier = lambda_multiplier
         self.random = np.random.RandomState(seed=1234)
         self.EMPIRICAL_LOW_UMI_TO_EMPTY_DROPLET_THRESHOLD = \
             consts.EMPIRICAL_LOW_UMI_TO_EMPTY_DROPLET_THRESHOLD
@@ -85,9 +91,6 @@ class SingleCellRNACountsDataset:
 
         # Load the dataset.
         self._load_data()
-
-        # At first, set the cell count prior to expected cells (could be None).
-        self.priors['n_cells'] = expected_cell_count
 
         # Trim the dataset.
         self._trim_dataset_for_analysis(total_droplet_barcodes=total_droplet_barcodes,
@@ -488,9 +491,9 @@ class SingleCellRNACountsDataset:
         logging.info("Preparing to write outputs to file...")
 
         # Create posterior.
-        self.posterior = ProbPosterior(self, inferred_model,
-                                       guide=inferred_model.guide,
-                                       counts_dtype=np.uint32)
+        self.posterior = ProbPosterior(dataset_obj=self,
+                                       vi_model=inferred_model,
+                                       lambda_multiplier=self.lambda_multiplier)
 
         # Encoded values of latent variables.
         enc = self.posterior.encodings
@@ -1071,10 +1074,21 @@ def get_d_priors_from_dataset(dataset: SingleCellRNACountsDataset) \
 
         # Estimate the number of UMI counts in cells.
 
-        # Median of log counts above 5 * empty counts is a robust
-        # cell estimator.
-        cell_log_counts = np.median(np.log1p(counts[counts > 5 * empty_counts]))
-        cell_counts = int(np.expm1(cell_log_counts).item())
+        # Use expected cells if it is available.
+        if dataset.priors['n_cells'] is not None:
+
+            # Sort order the cells by counts.
+            sort_order = np.argsort(counts)[::-1]
+
+            cell_counts = int(np.median(counts[sort_order]
+                                        [:dataset.priors['n_cells']]).item())
+
+        else:
+
+            # Median of log counts above 5 * empty counts is a robust
+            # cell estimator.
+            cell_log_counts = np.median(np.log1p(counts[counts > 5 * empty_counts]))
+            cell_counts = int(np.expm1(cell_log_counts).item())
 
         logging.info(f"Prior on counts in empty droplets is {empty_counts}")
 

@@ -45,6 +45,8 @@ class RemoveBackgroundPyroModel(nn.Module):
                  encoder: Union[nn.Module, encoder_module.CompositeEncoder],
                  decoder: nn.Module,
                  dataset_obj: 'SingleCellRNACountsDataset',
+                 rho_alpha_prior: float = 3,
+                 rho_beta_prior: float = 80,
                  use_cuda: bool = False):
         super(RemoveBackgroundPyroModel, self).__init__()
 
@@ -52,6 +54,9 @@ class RemoveBackgroundPyroModel(nn.Module):
         self.include_empties = True
         if self.model_type == "simple":
             self.include_empties = False
+        self.include_rho = False
+        if (self.model_type == "full") or (self.model_type == "swapping"):
+            self.include_rho = True
 
         self.n_genes = dataset_obj.analyzed_gene_inds.size
         self.z_dim = decoder.input_dim
@@ -86,9 +91,11 @@ class RemoveBackgroundPyroModel(nn.Module):
         self.d_cell_loc_prior = (np.log1p(dataset_obj.priors['cell_counts'],
                                           dtype=np.float32).item()
                                  * torch.ones(torch.Size([])).to(self.device))
-        self.d_cell_scale_prior = (np.array(dataset_obj.priors['d_std'],
-                                            dtype=np.float32).item()
-                                   * torch.ones(torch.Size([])).to(self.device))
+        # TODO:
+        self.d_cell_scale_prior = (torch.tensor(0.2).to(self.device))
+                                   #np.array(dataset_obj.priors['d_std'],
+                                            # dtype=np.float32).item()
+                                   # * torch.ones(torch.Size([])).to(self.device))
         self.z_loc_prior = torch.zeros(torch.Size([self.z_dim])).to(self.device)
         self.z_scale_prior = torch.ones(torch.Size([self.z_dim]))\
             .to(self.device)
@@ -109,21 +116,27 @@ class RemoveBackgroundPyroModel(nn.Module):
             assert chi_ambient_sum == 1., f"Issue with prior: chi_ambient " \
                                           f"should sum to 1, but it sums to " \
                                           f"{chi_ambient_sum}"
+            chi_bar_sum = np.round(dataset_obj.priors['chi_bar'].sum().item(),
+                                   decimals=4)
+            assert chi_bar_sum == 1., f"Issue with prior: chi_bar should " \
+                f"sum to 1, but is {chi_bar_sum}"
 
             self.d_empty_loc_prior = (np.log1p(dataset_obj
                                                .priors['empty_counts'],
                                                dtype=np.float32).item()
                                       * torch.ones(torch.Size([]))
                                       .to(self.device))
-            self.d_empty_scale_prior = (np.array(dataset_obj.priors['d_std'],
-                                                 dtype=np.float32).item()
-                                        * torch.ones(torch.Size([]))
-                                        .to(self.device))
+            # TODO:
+            self.d_empty_scale_prior = (torch.tensor(0.4).to(self.device))#, #np.array(dataset_obj.priors['d_std'],
+                                                 # dtype=np.float32).item()
+                                        # * torch.ones(torch.Size([])).to(self.device))
 
             self.p_logit_prior = (dataset_obj.priors['cell_logit']
                                   * torch.ones(torch.Size([])).to(self.device))
 
             self.chi_ambient_init = dataset_obj.priors['chi_ambient']\
+                .to(self.device)
+            self.avg_gene_expression = dataset_obj.priors['chi_bar'] \
                 .to(self.device)
 
             self.empty_UMI_threshold = (torch.tensor(dataset_obj.empty_UMI_threshold)
@@ -133,41 +146,58 @@ class RemoveBackgroundPyroModel(nn.Module):
 
             self.avg_gene_expression = None
 
+        self.rho_alpha_prior = (rho_alpha_prior
+                                * torch.ones(torch.Size([])).to(self.device))
+        self.rho_beta_prior = (rho_beta_prior
+                               * torch.ones(torch.Size([])).to(self.device))
+
+    def _calculate_lambda(self,
+                          epsilon: torch.Tensor,
+                          chi_ambient: torch.Tensor,
+                          d_empty: torch.Tensor,
+                          y: Union[torch.Tensor, None] = None,
+                          d_cell: Union[torch.Tensor, None] = None,
+                          rho: Union[torch.Tensor, None] = None,
+                          chi_bar: Union[torch.Tensor, None] = None):
+        """Calculate noise rate based on the model."""
+
+        if self.model_type == "simple" or self.model_type == "ambient":
+            lam = epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1) * chi_ambient
+
+        elif self.model_type == "swapping":
+            lam = (rho.unsqueeze(-1) * y.unsqueeze(-1)
+                   * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
+                   + d_empty.unsqueeze(-1)) * chi_bar
+
+        elif self.model_type == "full":
+            lam = (d_empty.unsqueeze(-1) * chi_ambient.unsqueeze(0)
+                   + (rho.unsqueeze(-1) * y.unsqueeze(-1)
+                      * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
+                      + d_empty.unsqueeze(-1)) * chi_bar)
+        else:
+            raise NotImplementedError(f"model_type was set to {self.model_type}, "
+                                      f"which is not implemented.")
+
+        return lam
+
     def _calculate_mu(self,
-                      chi: torch.Tensor,
-                      d_cell: torch.Tensor,
                       epsilon: torch.Tensor,
-                      y: Union[torch.Tensor, None] = None):
-        """Implement a calculation of mean expression based on the model."""
+                      d_cell: torch.Tensor,
+                      chi: torch.Tensor,
+                      y: Union[torch.Tensor, None] = None,
+                      rho: Union[torch.Tensor, None] = None):
+        """Calculate mean expression based on the model."""
 
-        if self.model_type == "simple":
-            """The model is that a latent variable z is drawn from a z_dim 
-            dimensional normal distribution.  This latent z is put through the 
-            decoder to generate a full vector of fractional gene expression, 
-            chi.  Counts are then drawn from a negative binomial distribution 
-            with mean d * chi.  d is drawn from a LogNormal distribution with 
-            the specified prior.  Phi is the overdispersion of this negative 
-            binomial, and is drawn from a Gamma distribution with the specified 
-            prior.
-
-            """
+        if self.model_type == 'simple':
             mu = epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1) * chi
 
-        elif self.model_type == "ambient":
-            """There is a global hyperparameter called chi_ambient.  This 
-            parameter
-            is the learned fractional gene expression vector for ambient RNA.
-            The model is that a latent variable z is drawn from a z_dim 
-            dimensional normal distribution.  This latent z is put through the 
-            decoder to generate a full vector of fractional gene expression, 
-            chi.  Counts are then drawn from a negative binomial distribution 
-            with mean d_cell * chi + d_ambient * chi_ambient.  d_cell is drawn 
-            from a LogNormal distribution with the specified prior, as is 
-            d_ambient.  Phi is the overdispersion of this negative binomial, 
-            and is drawn from a Gamma distribution with the specified prior.
-
-            """
+        elif self.model_type == 'ambient':
             mu = (y.unsqueeze(-1) * epsilon.unsqueeze(-1)
+                  * d_cell.unsqueeze(-1) * chi)
+
+        elif self.model_type == 'swapping' or self.model_type == 'full':
+            mu = ((1 - rho.unsqueeze(-1))
+                  * y.unsqueeze(-1) * epsilon.unsqueeze(-1)
                   * d_cell.unsqueeze(-1) * chi)
 
         else:
@@ -221,6 +251,14 @@ class RemoveBackgroundPyroModel(nn.Module):
                                                 scale=self.d_cell_scale_prior)
                                  .expand_by([x.size(0)]))
 
+            # Sample swapping fraction rho.
+            if self.include_rho:
+                rho = pyro.sample("rho", dist.Beta(self.rho_alpha_prior,
+                                                   self.rho_beta_prior)
+                                  .expand_by([x.size(0)]))
+            else:
+                rho = None
+
             # Sample epsilon based on priors.
             epsilon = torch.ones_like(alpha0).clone()
             # epsilon = pyro.sample("epsilon",
@@ -246,13 +284,20 @@ class RemoveBackgroundPyroModel(nn.Module):
                 y = None
 
             # Calculate the mean gene expression counts (for each barcode).
-            mu_cell = self._calculate_mu(chi=chi,
+            mu_cell = self._calculate_mu(epsilon=epsilon,
                                          d_cell=d_cell,
-                                         epsilon=epsilon,
-                                         y=y)
+                                         chi=chi,
+                                         y=y,
+                                         rho=rho)
 
-            lam = (epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1)
-                   * chi_ambient)
+            # Calculate the background rate parameter (for each barcode).
+            lam = self._calculate_lambda(epsilon=epsilon,
+                                         chi_ambient=chi_ambient,
+                                         d_empty=d_empty,
+                                         y=y,
+                                         d_cell=d_cell,
+                                         rho=rho,
+                                         chi_bar=self.avg_gene_expression)
 
             # print(f'alpha range is [{alpha0.min():.0f}, '
             #       f'{alpha0.mean():.0f}, {alpha0.max():.0f}]')
@@ -328,6 +373,17 @@ class RemoveBackgroundPyroModel(nn.Module):
                                      torch.ones(torch.Size([])).to(self.device),
                                      constraint=constraints.simplex)
 
+        # Initialize variational parameters for rho.
+        if self.include_rho:
+            rho_alpha = pyro.param("rho_alpha",
+                                   self.rho_alpha_prior *
+                                   torch.ones(torch.Size([])).to(self.device),
+                                   constraint=constraints.positive)
+            rho_beta = pyro.param("rho_beta",
+                                  self.rho_beta_prior *
+                                  torch.ones(torch.Size([])).to(self.device),
+                                  constraint=constraints.positive)
+
         # Happens in parallel for each data point (cell barcode) independently:
         with pyro.plate("data", x.size(0),
                         use_cuda=self.use_cuda, device=self.device):
@@ -340,6 +396,11 @@ class RemoveBackgroundPyroModel(nn.Module):
 
             else:
                 enc = self.encoder.forward(x=x, chi_ambient=None)
+
+            # Sample swapping fraction rho.
+            if self.include_rho:
+                pyro.sample("rho", dist.Beta(rho_alpha,
+                                             rho_beta).expand_by([x.size(0)]))
 
             # Code specific to models with empty droplets.
             if self.include_empties:

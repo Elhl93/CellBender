@@ -87,6 +87,9 @@ class CLI(AbstractCLI):
         # Set use_jit to False.
         args.use_jit = False
 
+        # Ensure lambda_multiplier is positive.
+        assert args.lambda_multiplier > 0.
+
         self.args = args
 
         return args
@@ -138,15 +141,14 @@ def run_remove_background(args):
     try:
         dataset_obj = \
             SingleCellRNACountsDataset(input_file=args.input_file,
-                                       expected_cell_count=
-                                       args.expected_cell_count,
-                                       total_droplet_barcodes=
-                                       args.total_droplets,
+                                       expected_cell_count=args.expected_cell_count,
+                                       total_droplet_barcodes=args.total_droplets,
                                        fraction_empties=args.fraction_empties,
                                        model_name=args.model,
                                        gene_blacklist=args.blacklisted_genes,
-                                       low_count_threshold=
-                                       args.low_count_threshold)
+                                       low_count_threshold=args.low_count_threshold,
+                                       lambda_multiplier=args.lambda_multiplier)
+
     except OSError:
         logging.error(f"OSError: Unable to open file {args.input_file}.")
         return

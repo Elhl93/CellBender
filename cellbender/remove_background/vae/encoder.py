@@ -307,10 +307,9 @@ class EncodeNonEmptyDropletLogitProb(nn.Module):
         self.input_dim = input_dim
         self.transform = input_transform
         self.param = log_count_crossover
-        self.INITIAL_WEIGHT_FOR_LOG_COUNTS = 1.
-        self.INITIAL_OUTPUT_SCALE_FOR_LOG_COUNTS = 5.
-        self.INITIAL_OUTPUT_BIAS_FOR_LOG_COUNTS = \
-            -1 * self.INITIAL_OUTPUT_SCALE_FOR_LOG_COUNTS
+        self.INITIAL_WEIGHT_FOR_LOG_COUNTS = 2.
+        self.OUTPUT_SCALE = 1.
+        self.log_count_crossover = log_count_crossover
 
         # Set up the linear transformations used in fully-connected layers.
         # Adjust initialization conditions to start with a reasonable output.
@@ -326,12 +325,14 @@ class EncodeNonEmptyDropletLogitProb(nn.Module):
         self.output = nn.Linear(hidden_dims[-1], output_dim)
         # Initialize p to be a sigmoid function of UMI counts.
         with torch.no_grad():
-            self.output.weight[0][0] = self.INITIAL_OUTPUT_SCALE_FOR_LOG_COUNTS
-            self.output.bias.data.copy_(torch.tensor([self.INITIAL_OUTPUT_BIAS_FOR_LOG_COUNTS
-                                                      * log_count_crossover]))
+            self.output.weight[0][0] = self.INITIAL_WEIGHT_FOR_LOG_COUNTS
+            # self.output.bias.data.copy_(torch.tensor([self.INITIAL_OUTPUT_BIAS_FOR_LOG_COUNTS]))
 
         # Set up the non-linear activations.
         self.softplus = nn.Softplus()
+
+        # Set up the initial bias.
+        self.offset = None
 
     def forward(self,
                 x: torch.Tensor,
@@ -356,7 +357,26 @@ class EncodeNonEmptyDropletLogitProb(nn.Module):
         for i in range(1, len(self.linears)):  # Second hidden layer onward
             hidden = self.softplus(self.linears[i](hidden))
 
-        return self.output(hidden).squeeze(-1)
+        out = self.output(hidden).squeeze(-1)
+
+        if self.offset is None:
+
+            # Expected number of empties.
+            expected_empties = (log_sum < self.log_count_crossover).sum()
+            sort_out = torch.argsort(out, descending=False)
+            # self.offset = out[sort_out][expected_empties + 1]  # works
+            # self.offset = (out[sort_out][:expected_empties].median().item()
+            #                + out[sort_out][expected_empties:].median().item()) / 2  # works
+
+            cells = (log_sum > self.log_count_crossover).squeeze()
+            cell_median = out[cells].median().item()
+            empty_median = out[~cells].median().item()
+            self.offset = empty_median + (cell_median - empty_median) * 3 / 4
+
+            print(f'Seems there are {expected_empties} empties out of {x.shape[0]}')
+            print(f'The offset is {self.offset}')
+
+        return (out - self.offset) * self.OUTPUT_SCALE
 
 
 def transform_input(x: torch.Tensor, transform: str) -> Union[torch.Tensor,

@@ -19,7 +19,7 @@ class Posterior(ABC):
 
     Args:
         dataset_obj: Dataset object.
-        vi_model: VariationalInferenceModel
+        vi_model: Trained RemoveBackgroundPyroModel.
         counts_dtype: Data type of posterior count matrix.  Can be one of
             [np.uint32, np.float]
         float_threshold: For floating point count matrices, counts below
@@ -32,8 +32,8 @@ class Posterior(ABC):
     """
 
     def __init__(self,
-                 dataset_obj,  # Dataset
-                 vi_model,  # Trained variational inference model
+                 dataset_obj: 'SingleCellRNACountsDataset',  # Dataset
+                 vi_model: 'RemoveBackgroundPyroModel',
                  counts_dtype: np.dtype = np.uint32,
                  float_threshold: float = 0.5):
         self.dataset_obj = dataset_obj
@@ -142,7 +142,7 @@ class ImputedPosterior(Posterior):
 
     Args:
         dataset_obj: Dataset object.
-        vi_model: VariationalInferenceModel
+        vi_model: Trained RemoveBackgroundPyroModel.
         guide: Variational posterior pyro guide function, optional.  Only
             specify if the required guide function is not vi_model.guide.
         encoder: Encoder that provides encodings of data.
@@ -159,8 +159,8 @@ class ImputedPosterior(Posterior):
     """
 
     def __init__(self,
-                 dataset_obj,  # Dataset
-                 vi_model,  # Trained variational inference model
+                 dataset_obj: 'SingleCellRNACountsDataset',  # Dataset
+                 vi_model: 'RemoveBackgroundPyroModel',  # Trained variational inference model
                  guide=None,
                  encoder=None,  #: Union[CompositeEncoder, None] = None,
                  counts_dtype: np.dtype = np.uint32,
@@ -227,10 +227,9 @@ class ProbPosterior(Posterior):
 
     Args:
         dataset_obj: Dataset object.
-        vi_model: VariationalInferenceModel
-        guide: Variational posterior pyro guide function, optional.  Only
-            specify if the required guide function is not vi_model.guide.
-        encoder: Encoder that provides encodings of data.
+        vi_model: Trained model: RemoveBackgroundPyroModel
+        lambda_multiplier: Factor by which background count estimator is
+            multiplied before MAP estimation.
         counts_dtype: Data type of posterior count matrix.  Can be one of
             [np.uint32, np.float]
         float_threshold: For floating point count matrices, counts below
@@ -244,21 +243,18 @@ class ProbPosterior(Posterior):
     """
 
     def __init__(self,
-                 dataset_obj,  # Dataset
-                 vi_model,  # Trained variational inference model
-                 guide=None,
-                 encoder=None,  #: Union[CompositeEncoder, None] = None,
-                 counts_dtype: np.dtype = np.uint32,
+                 dataset_obj: 'SingleCellRNACountsDataset',
+                 vi_model: 'RemoveBackgroundPyroModel',
+                 lambda_multiplier: float = 1.,
                  float_threshold: float = 0.5):
         self.vi_model = vi_model
         self.use_cuda = vi_model.use_cuda
-        self.guide = guide if guide is not None else vi_model.encoder
-        self.encoder = encoder if encoder is not None else vi_model.encoder
+        self.lambda_multiplier = lambda_multiplier
         self._encodings = None
         self._mean = None
         super(ProbPosterior, self).__init__(dataset_obj=dataset_obj,
                                             vi_model=vi_model,
-                                            counts_dtype=counts_dtype,
+                                            counts_dtype=np.uint32,
                                             float_threshold=float_threshold)
 
     @torch.no_grad()
@@ -272,8 +268,7 @@ class ProbPosterior(Posterior):
         analyzed_bcs_only = True
 
         data_loader = self.dataset_obj.get_dataloader(use_cuda=self.use_cuda,
-                                                      analyzed_bcs_only=
-                                                      analyzed_bcs_only,
+                                                      analyzed_bcs_only=analyzed_bcs_only,
                                                       batch_size=100,
                                                       shuffle=False)
 
@@ -290,7 +285,7 @@ class ProbPosterior(Posterior):
             dense_counts = self._compute_true_counts(data,
                                                      chi_ambient,
                                                      use_map=False,
-                                                     n_samples=21)
+                                                     n_samples=3)  # TODO: 13
             bcs_i_chunk, genes_i, counts_i = self.dense_to_sparse(dense_counts)
 
             # Translate chunk barcode inds to overall inds.
@@ -369,11 +364,11 @@ class ProbPosterior(Posterior):
                 mu_sample, lambda_sample, alpha_sample = \
                     self._param_sample(data, chi_ambient)
 
-                # Compute the de-noised count matrix given the MAP estimates.
+                # Compute the de-noised count matrix given the estimates.
                 dense_counts_torch[..., i] = \
                     self._true_counts_from_params(data,
                                                   mu_sample,
-                                                  lambda_sample,
+                                                  lambda_sample * self.lambda_multiplier,
                                                   alpha_sample)
 
             # Take the mode of the posterior true count distribution.
