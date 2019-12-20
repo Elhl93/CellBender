@@ -31,4 +31,4 @@ FRACTION_EMPTIES = 0.5
 
 # Prior mean and std in log space for alpha0, the Dirichlet precision for cells.
 ALPHA0_PRIOR_LOC = 7.
-ALPHA0_PRIOR_SCALE = 2.
+ALPHA0_PRIOR_SCALE = 4.

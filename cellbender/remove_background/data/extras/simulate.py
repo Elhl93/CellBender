@@ -2,6 +2,7 @@
 
 import numpy as np
 import scipy.sparse as sp
+import torch
 from typing import Tuple, List, Union
 
 
@@ -389,8 +390,8 @@ def sample_from_dirichlet_model(num: int,
                                 eps_param: float,
                                 random_seed: int = 0) -> Tuple[np.ndarray,
                                                                np.ndarray]:
-    """Draw samples of cell expression profiles using the Dirichlet Poisson sum
-    model.
+    """Draw samples of cell expression profiles using the Dirichlet-Poisson,
+    Poisson sum model.
 
     Args:
         num: Number of expression profiles to draw.
@@ -455,3 +456,59 @@ def sample_from_dirichlet_model(num: int,
 
     # Output observed counts are the sum, but return them separately.
     return c_real, c_bkg
+
+
+def _calculate_lambda(model_type: str,
+                      epsilon: torch.Tensor,
+                      chi_ambient: torch.Tensor,
+                      d_empty: torch.Tensor,
+                      y: Union[torch.Tensor, None] = None,
+                      d_cell: Union[torch.Tensor, None] = None,
+                      rho: Union[torch.Tensor, None] = None,
+                      chi_bar: Union[torch.Tensor, None] = None):
+    """Calculate noise rate based on the model."""
+
+    if model_type == "simple" or model_type == "ambient":
+        lam = epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1) * chi_ambient
+
+    elif model_type == "swapping":
+        lam = (rho.unsqueeze(-1) * y.unsqueeze(-1)
+               * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
+               + d_empty.unsqueeze(-1)) * chi_bar
+
+    elif model_type == "full":
+        lam = (d_empty.unsqueeze(-1) * chi_ambient.unsqueeze(0)
+               + (rho.unsqueeze(-1) * y.unsqueeze(-1)
+                  * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
+                  + d_empty.unsqueeze(-1)) * chi_bar)
+    else:
+        raise NotImplementedError(f"model_type was set to {model_type}, "
+                                  f"which is not implemented.")
+
+    return lam
+
+def _calculate_mu(model_type: str,
+                  epsilon: torch.Tensor,
+                  d_cell: torch.Tensor,
+                  chi: torch.Tensor,
+                  y: Union[torch.Tensor, None] = None,
+                  rho: Union[torch.Tensor, None] = None):
+    """Calculate mean expression based on the model."""
+
+    if model_type == 'simple':
+        mu = epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1) * chi
+
+    elif model_type == 'ambient':
+        mu = (y.unsqueeze(-1) * epsilon.unsqueeze(-1)
+              * d_cell.unsqueeze(-1) * chi)
+
+    elif model_type == 'swapping' or model_type == 'full':
+        mu = ((1 - rho.unsqueeze(-1))
+              * y.unsqueeze(-1) * epsilon.unsqueeze(-1)
+              * d_cell.unsqueeze(-1) * chi)
+
+    else:
+        raise NotImplementedError(f"model_type was set to {model_type}, "
+                                  f"which is not implemented.")
+
+    return mu

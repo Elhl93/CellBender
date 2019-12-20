@@ -92,7 +92,7 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                            help="Dimension of hidden layers in the encoder "
                                 "for z.")
     subparser.add_argument("--alpha-layers", nargs="+", type=int,
-                           default=[512, 128, 32],
+                           default=[32, 8],
                            dest="alpha_hidden_dims",
                            help="Dimension of hidden layers in the encoder "
                                 "for alpha, the Dirichlet precision.")
@@ -130,10 +130,10 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                                 "removal is accompanied by more signal removal "
                                 "at high values of lambda.")
     subparser.add_argument("--learning-rate", nargs=None,
-                           type=float, default=1e-3,
+                           type=float, default=5e-4,
                            dest="learning_rate",
                            help="Training detail: learning rate for "
                                 "inference (probably "
-                                "do not exceed 1e-3).")
+                                "do not exceed 5e-4).")
 
     return subparsers

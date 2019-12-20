@@ -128,6 +128,12 @@ def run_training(model: RemoveBackgroundPyroModel,
             train_elbo.append(-total_epoch_loss_train)
             model.loss['train']['epoch'].append(epoch)
             model.loss['train']['elbo'].append(-total_epoch_loss_train)
+
+            # TODO:
+            model.store_vars(x=train_loader.__next__(), params=['alpha0', 'd_cell',
+                                                                'd_empty', 'y',
+                                                                'p_passback', 'lam'])
+
             logging.info("[epoch %03d]  average training loss: %.4f"
                          % (epoch, total_epoch_loss_train))
 
@@ -219,7 +225,9 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
     # Decoder.
     decoder = Decoder(input_dim=args.z_dim,
                       hidden_dims=args.z_hidden_dims[::-1],
-                      output_dim=count_matrix.shape[1])
+                      output_dim=count_matrix.shape[1],
+                      prior_cell_counts=dataset_obj.priors['cell_counts'],
+                      prior_empty_counts=dataset_obj.priors['empty_counts'])
 
     # Set up the pyro model for variational inference.
     model = RemoveBackgroundPyroModel(model_type=args.model,
@@ -229,7 +237,7 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
                                       use_cuda=args.use_cuda)
 
     # Set up the optimizer.
-    adam_args = {"lr": args.learning_rate}
+    adam_args = {'lr': args.learning_rate}
     optimizer = ClippedAdam(adam_args)
 
     # Determine the loss function.

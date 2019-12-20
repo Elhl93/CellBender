@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import pyro
 from typing import List
 
 
@@ -36,11 +37,18 @@ class Decoder(nn.Module):
 
     """
 
-    def __init__(self, input_dim: int, hidden_dims: List[int], output_dim: int,
+    def __init__(self,
+                 input_dim: int,
+                 hidden_dims: List[int],
+                 output_dim: int,
+                 prior_cell_counts: int,
+                 prior_empty_counts: int,
                  log_output: bool = False):
         super(Decoder, self).__init__()
         self.input_dim = input_dim
         self.log_output = log_output
+        self.prior_cell_counts = prior_cell_counts
+        self.prior_empty_counts = prior_empty_counts
 
         # Set up the linear transformations used in fully-connected layers.
         self.linears = nn.ModuleList([nn.Linear(input_dim, hidden_dims[0])])
@@ -65,5 +73,15 @@ class Decoder(nn.Module):
 
         # Compute the output, which is on a simplex.
         gene_exp = self.softmax(self.outlinear(hidden))
+
+        # # TODO =============
+        #
+        # # Initialization: remove background using a heuristic.
+        # gene_exp = torch.clamp(gene_exp * self.prior_cell_counts
+        #                        - pyro.param("chi_ambient").detach() * self.prior_empty_counts,
+        #                        min=1e-30)
+        # gene_exp = gene_exp / gene_exp.sum(dim=-1, keepdim=True)
+        #
+        # # TODO =============
 
         return gene_exp

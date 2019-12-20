@@ -495,6 +495,9 @@ class SingleCellRNACountsDataset:
                                        vi_model=inferred_model,
                                        lambda_multiplier=self.lambda_multiplier)
 
+        # TODO:
+        np.save(output_file[:-3] + '_debug_params.npy', inferred_model.loss['params'])
+
         # Encoded values of latent variables.
         enc = self.posterior.encodings
         z = enc['z']
@@ -994,8 +997,8 @@ def write_matrix_to_cellranger_h5(
                 f.create_array(group, "latent_cell_probability", p)
             if alpha is not None:
                 f.create_array(group, "latent_dirichlet_precision", alpha)
-            # if rho is not None:
-            #     f.create_array(group, "contamination_fraction_params", rho)
+            if rho is not None:
+                f.create_array(group, "contamination_fraction_params", rho)
             # if phi is not None:
             #     f.create_array(group, "overdispersion_params", phi)
             if loss is not None:

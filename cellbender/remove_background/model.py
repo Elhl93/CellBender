@@ -63,7 +63,8 @@ class RemoveBackgroundPyroModel(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.loss = {'train': {'epoch': [], 'elbo': []},
-                     'test': {'epoch': [], 'elbo': []}}
+                     'test': {'epoch': [], 'elbo': []},
+                     'params': {}}  # TODO
 
         # Determine whether we are working on a GPU.
         if use_cuda:
@@ -151,6 +152,10 @@ class RemoveBackgroundPyroModel(nn.Module):
         self.rho_beta_prior = (rho_beta_prior
                                * torch.ones(torch.Size([])).to(self.device))
 
+        # TODO:
+        print(f'log_p(c=2000 | full) = {dist.LogNormal(self.d_cell_loc_prior, self.d_cell_scale_prior).log_prob(torch.Tensor([2000.])).item()}')
+        print(f'log_p(c=2000 | empty) = {dist.LogNormal(self.d_empty_loc_prior, self.d_empty_scale_prior).log_prob(torch.Tensor([2000.])).item()}')
+
     def _calculate_lambda(self,
                           epsilon: torch.Tensor,
                           chi_ambient: torch.Tensor,
@@ -232,8 +237,8 @@ class RemoveBackgroundPyroModel(nn.Module):
 
             # Sample z from prior.
             z = pyro.sample("z",
-                            dist.Normal(self.z_loc_prior,
-                                        self.z_scale_prior)
+                            dist.Normal(loc=self.z_loc_prior,
+                                        scale=self.z_scale_prior)
                             .expand_by([x.size(0)]).to_event(1))
 
             # Decode the latent code z to get fractional gene expression, chi.
@@ -277,7 +282,7 @@ class RemoveBackgroundPyroModel(nn.Module):
 
                 # Sample y, the presence of a real cell, based on p_logit_prior.
                 y = pyro.sample("y",
-                                dist.Bernoulli(logits=self.p_logit_prior)
+                                dist.Bernoulli(logits=self.p_logit_prior * 0.001)  # TODO
                                 .expand_by([x.size(0)]))
             else:
                 d_empty = None
@@ -331,9 +336,12 @@ class RemoveBackgroundPyroModel(nn.Module):
                                                     NullDist(torch.zeros(1)
                                                              .to(self.device))
                                                     .expand_by([x.size(0)]))
-                    pyro.sample("obs_empty_y",
-                                dist.Bernoulli(logits=p_logit_posterior),
-                                obs=torch.zeros_like(y))
+
+                    with poutine.scale(scale=1.):  # TODO: is this whole section doing anything?
+
+                        pyro.sample("obs_empty_y",
+                                    dist.Bernoulli(logits=p_logit_posterior),
+                                    obs=torch.zeros_like(y))
 
     @config_enumerate(default='parallel')
     def guide(self, x: torch.Tensor):
@@ -353,6 +361,14 @@ class RemoveBackgroundPyroModel(nn.Module):
                                   self.d_cell_scale_prior *
                                   torch.ones(torch.Size([])).to(self.device),
                                   constraint=constraints.positive)
+
+        # # TODO: testing
+        # # Initialize variational parameters for alpha0.
+        # alpha0_loc = pyro.param("alpha0_loc",
+        #                         torch.tensor(consts.ALPHA0_PRIOR_LOC).to(self.device))
+        # alpha0_scale = pyro.param("alpha0_scale",
+        #                           torch.tensor(consts.ALPHA0_PRIOR_SCALE).to(self.device),
+        #                           constraint=constraints.positive)
 
         if self.include_empties:
 
@@ -390,29 +406,32 @@ class RemoveBackgroundPyroModel(nn.Module):
 
             # TODO: epsilon inference
 
-            # Encode the latent variables from the input gene expression counts.
-            if self.include_empties:
-                enc = self.encoder.forward(x=x, chi_ambient=chi_ambient)
-
-            else:
-                enc = self.encoder.forward(x=x, chi_ambient=None)
-
             # Sample swapping fraction rho.
             if self.include_rho:
                 pyro.sample("rho", dist.Beta(rho_alpha,
                                              rho_beta).expand_by([x.size(0)]))
 
-            # Code specific to models with empty droplets.
+            # Encode the latent variables from the input gene expression counts.
             if self.include_empties:
 
                 # Sample d_empty, which doesn't depend on y.
-                pyro.sample("d_empty",
-                            dist.LogNormal(loc=d_empty_loc,
-                                           scale=d_empty_scale)
-                            .expand_by([x.size(0)]))
+                d_empty = pyro.sample("d_empty",
+                                      dist.LogNormal(loc=d_empty_loc,
+                                                     scale=d_empty_scale)
+                                      .expand_by([x.size(0)]))
+
+                epsilon = torch.ones(x.shape[0])
+
+                enc = self.encoder.forward(x=x, chi_ambient=chi_ambient)
+
+            else:
+                enc = self.encoder.forward(x=x, chi_ambient=None)
+
+            # Code specific to models with empty droplets.
+            if self.include_empties:\
 
                 # Pass back the inferred p_y to the model.
-                pyro.sample("p_passback", NullDist(enc['p_y']))
+                pyro.sample("p_passback", NullDist(enc['p_y'].detach()))  # TODO
 
                 # Sample the Bernoulli y from encoded p(y).
                 y = pyro.sample("y", dist.Bernoulli(logits=enc['p_y']))
@@ -430,10 +449,13 @@ class RemoveBackgroundPyroModel(nn.Module):
                     # Sample alpha0 for the barcodes containing cells.
                     pyro.sample("alpha0",
                                 dist.LogNormal(loc=enc['alpha0']['loc'],
-                                               scale=0.1))
+                                               scale=enc['alpha0']['scale']))
+
+                    # # TODO: testing
+                    # # Sample alpha0 for the barcodes containing cells.
                     # pyro.sample("alpha0",
-                    #             dist.LogNormal(loc=enc['alpha0']['loc'],
-                    #                            scale=enc['alpha0']['scale']))
+                    #             dist.LogNormal(loc=torch.tensor(2000.).to(self.device).log(),
+                    #                            scale=0.01))
 
                 # Gate d_cell_loc so empty droplets do not give big gradients.
                 prob = enc['p_y'].sigmoid()  # Logits to probability
@@ -459,8 +481,55 @@ class RemoveBackgroundPyroModel(nn.Module):
                 # Sample alpha0 for the barcodes containing cells.
                 pyro.sample("alpha0",
                             dist.LogNormal(loc=enc['alpha0']['loc'],
-                                           scale=enc['alpha0']['scale'])
-                            .to_event(1))
+                                           scale=enc['alpha0']['scale']))
+
+    def store_vars(self, x, params=None):
+        """Temp method to store params for inspection.
+        Keep them in loss, so they get stored.
+        """
+
+        if params is None:
+            return
+
+        # trace the guide
+        trace = poutine.trace(self.guide).get_trace(x)
+
+        cells_only = True
+        if cells_only:
+            cells = trace.nodes['y']['value'] == 1.
+
+        for p in params:
+            if p == 'lam':
+                if p + ':mean' not in self.loss['params'].keys():
+                    self.loss['params'][p + ':mean'] = []
+                    self.loss['params'][p + ':std'] = []
+                rho = trace.nodes['rho']['value'] if self.model_type != 'ambient' else None
+                lam = self._calculate_lambda(epsilon=torch.tensor(1.).to(self.device),
+                                             chi_ambient=pyro.param("chi_ambient"),
+                                             d_empty=trace.nodes['d_empty']['value'],
+                                             y=trace.nodes['y']['value'],
+                                             d_cell=trace.nodes['d_cell']['value'],
+                                             rho=rho,
+                                             chi_bar=self.avg_gene_expression)
+                val_mean = lam.mean().detach().cpu().numpy().item()
+                val_std = lam.std().detach().cpu().numpy().item()
+                self.loss['params'][p + ':mean'].append(val_mean)
+                self.loss['params'][p + ':std'].append(val_std)
+            elif p != 'y':
+                if p + ':mean' not in self.loss['params'].keys():
+                    self.loss['params'][p + ':mean'] = []
+                    self.loss['params'][p + ':std'] = []
+                vals = trace.nodes[p]['value']
+                if cells_only:
+                    vals = vals[cells]
+                val_mean = vals.mean().detach().cpu().numpy().item()
+                val_std = vals.std().detach().cpu().numpy().item()
+                self.loss['params'][p + ':mean'].append(val_mean)
+                self.loss['params'][p + ':std'].append(val_std)
+            else:
+                if 'y:sum' not in self.loss['params'].keys():
+                    self.loss['params']['y:sum'] = []
+                self.loss['params'][p + ':sum'].append(trace.nodes[p]['value'].sum().detach().cpu().numpy().item())
 
 
 def get_encodings(model: RemoveBackgroundPyroModel,

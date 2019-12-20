@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
+import pyro
+
 import cellbender.remove_background.consts as consts
+
 from typing import Dict, List, Union
 import warnings
 
@@ -156,7 +159,9 @@ class EncodeAlpha0(nn.Module):
         # Set up the non-linear activations.
         self.softplus = nn.Softplus()
 
-    def forward(self, x: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
+    def forward(self,
+                x: torch.Tensor,
+                **kwargs) -> Dict[str, torch.Tensor]:
         # Define the forward computation to go from gene expression to latent
         # representation.
 
@@ -336,7 +341,8 @@ class EncodeNonEmptyDropletLogitProb(nn.Module):
 
     def forward(self,
                 x: torch.Tensor,
-                chi_ambient: torch.Tensor) -> torch.Tensor:
+                chi_ambient: torch.Tensor,
+                **kwargs) -> torch.Tensor:
         # Define the forward computation to go from gene expression to cell
         # probabilities.  The log of the total UMI counts is concatenated with
         # the input gene expression and the estimate of the difference between

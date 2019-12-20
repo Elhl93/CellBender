@@ -105,24 +105,26 @@ class Posterior(ABC):
         Barcode numbering is relative to the tensor passed in.
         """
 
-        if self.dtype == np.uint32:
+        if chunk_dense_counts.dtype != np.int:
 
-            # Turn the floating point count estimates into integers.
-            decimal_values, _ = np.modf(chunk_dense_counts)  # Stuff after decimal.
-            roundoff_counts = np.random.binomial(1, p=decimal_values)  # Bernoulli.
-            chunk_dense_counts = np.floor(chunk_dense_counts).astype(dtype=int)
-            chunk_dense_counts += roundoff_counts
+            if self.dtype == np.uint32:
 
-        elif self.dtype == np.float32:
+                # Turn the floating point count estimates into integers.
+                decimal_values, _ = np.modf(chunk_dense_counts)  # Stuff after decimal.
+                roundoff_counts = np.random.binomial(1, p=decimal_values)  # Bernoulli.
+                chunk_dense_counts = np.floor(chunk_dense_counts).astype(dtype=int)
+                chunk_dense_counts += roundoff_counts
 
-            # Truncate counts at a threshold value.
-            chunk_dense_counts = (chunk_dense_counts *
-                                  (chunk_dense_counts > self.float_threshold))
+            elif self.dtype == np.float32:
 
-        else:
-            raise NotImplementedError(f"Count matrix dtype {self.dtype} is not "
-                                      f"supported.  Choose from [np.uint32, "
-                                      f"np.float32]")
+                # Truncate counts at a threshold value.
+                chunk_dense_counts = (chunk_dense_counts *
+                                      (chunk_dense_counts > self.float_threshold))
+
+            else:
+                raise NotImplementedError(f"Count matrix dtype {self.dtype} is not "
+                                          f"supported.  Choose from [np.uint32, "
+                                          f"np.float32]")
 
         # Find all the nonzero counts in this dense matrix chunk.
         nonzero_barcode_inds_this_chunk, nonzero_genes_trimmed = \
@@ -284,8 +286,8 @@ class ProbPosterior(Posterior):
             # Compute an estimate of the true counts.
             dense_counts = self._compute_true_counts(data,
                                                      chi_ambient,
-                                                     use_map=False,
-                                                     n_samples=3)  # TODO: 13
+                                                     use_map=False,  # TODO: False
+                                                     n_samples=5)  # TODO: 13
             bcs_i_chunk, genes_i, counts_i = self.dense_to_sparse(dense_counts)
 
             # Translate chunk barcode inds to overall inds.
@@ -372,8 +374,11 @@ class ProbPosterior(Posterior):
                                                   alpha_sample)
 
             # Take the mode of the posterior true count distribution.
-            dense_counts = dense_counts_torch.detach().cpu().numpy()
-            dense_counts = scipy_mode(dense_counts, axis=2)[0].squeeze()
+            # dense_counts = dense_counts_torch.detach().cpu().numpy()
+            # dense_counts = scipy_mode(dense_counts, axis=2)[0].squeeze()
+
+            # TODO: changed to median: check this
+            dense_counts = dense_counts_torch.median(dim=2, keepdim=False)[0].detach().cpu().numpy()
 
         return dense_counts
 
