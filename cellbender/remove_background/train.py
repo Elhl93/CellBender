@@ -11,7 +11,7 @@ from cellbender.remove_background.model import RemoveBackgroundPyroModel
 from cellbender.remove_background.vae.decoder import Decoder
 from cellbender.remove_background.vae.encoder \
     import EncodeZ, EncodeD, EncodeNonEmptyDropletLogitProb, \
-    EncodeAlpha0, CompositeEncoder
+    EncodeAlpha0, CompositeEncoder, EncodeNonZLatents
 from cellbender.remove_background.data.dataset import SingleCellRNACountsDataset
 from cellbender.remove_background.data.dataprep import \
     prep_sparse_data_for_training as prep_data_for_training
@@ -132,7 +132,8 @@ def run_training(model: RemoveBackgroundPyroModel,
             # TODO:
             model.store_vars(x=train_loader.__next__(), params=['alpha0', 'd_cell',
                                                                 'd_empty', 'y',
-                                                                'p_passback', 'lam'])
+                                                                'p_passback', 'lam',
+                                                                'epsilon'])
 
             logging.info("[epoch %03d]  average training loss: %.4f"
                          % (epoch, total_epoch_loss_train))
@@ -192,35 +193,44 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
                         output_dim=args.z_dim,
                         input_transform='normalize')
 
-    encoder_alpha0 = EncodeAlpha0(input_dim=count_matrix.shape[1],
-                                  hidden_dims=args.alpha_hidden_dims)
+    encoder_other = EncodeNonZLatents(n_genes=count_matrix.shape[1],
+                                      hidden_dims=[50, 10],  # TODO
+                                      # hidden_dims=[100, 50],  # TODO
+                                      log_count_crossover=dataset_obj.priors['log_counts_crossover'],
+                                      input_transform='normalize')
 
-    encoder_d = EncodeD(input_dim=count_matrix.shape[1],
-                        hidden_dims=args.d_hidden_dims,
-                        output_dim=1,
-                        log_count_crossover=
-                        dataset_obj.priors['log_counts_crossover'])
+    encoder = CompositeEncoder({'z': encoder_z,
+                                'other': encoder_other})
 
-    if args.model == "simple":
-
-        # If using the simple model, there is no need for p.
-        encoder = CompositeEncoder({'z': encoder_z,
-                                    'alpha0': encoder_alpha0,
-                                    'd_loc': encoder_d})
-
-    else:
-
-        # Models that include empty droplets.
-        encoder_p = EncodeNonEmptyDropletLogitProb(
-            input_dim=count_matrix.shape[1],
-            hidden_dims=args.p_hidden_dims,
-            output_dim=1,
-            input_transform='normalize',
-            log_count_crossover=dataset_obj.priors['log_counts_crossover'])
-        encoder = CompositeEncoder({'z': encoder_z,
-                                    'alpha0': encoder_alpha0,
-                                    'd_loc': encoder_d,
-                                    'p_y': encoder_p})
+    # encoder_alpha0 = EncodeAlpha0(input_dim=count_matrix.shape[1],
+    #                               hidden_dims=args.alpha_hidden_dims)
+    #
+    # encoder_d = EncodeD(input_dim=count_matrix.shape[1],
+    #                     hidden_dims=args.d_hidden_dims,
+    #                     output_dim=1,
+    #                     log_count_crossover=
+    #                     dataset_obj.priors['log_counts_crossover'])
+    #
+    # if args.model == "simple":
+    #
+    #     # If using the simple model, there is no need for p.
+    #     encoder = CompositeEncoder({'z': encoder_z,
+    #                                 'alpha0': encoder_alpha0,
+    #                                 'd_loc': encoder_d})
+    #
+    # else:
+    #
+    #     # Models that include empty droplets.
+    #     encoder_p = EncodeNonEmptyDropletLogitProb(
+    #         input_dim=count_matrix.shape[1],
+    #         hidden_dims=args.p_hidden_dims,
+    #         output_dim=1,
+    #         input_transform='normalize',
+    #         log_count_crossover=dataset_obj.priors['log_counts_crossover'])
+    #     encoder = CompositeEncoder({'z': encoder_z,
+    #                                 'alpha0': encoder_alpha0,
+    #                                 'd_loc': encoder_d,
+    #                                 'p_y': encoder_p})
 
     # Decoder.
     decoder = Decoder(input_dim=args.z_dim,

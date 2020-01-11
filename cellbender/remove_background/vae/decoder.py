@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import pyro
 from typing import List
 
 
@@ -73,15 +72,5 @@ class Decoder(nn.Module):
 
         # Compute the output, which is on a simplex.
         gene_exp = self.softmax(self.outlinear(hidden))
-
-        # # TODO =============
-        #
-        # # Initialization: remove background using a heuristic.
-        # gene_exp = torch.clamp(gene_exp * self.prior_cell_counts
-        #                        - pyro.param("chi_ambient").detach() * self.prior_empty_counts,
-        #                        min=1e-30)
-        # gene_exp = gene_exp / gene_exp.sum(dim=-1, keepdim=True)
-        #
-        # # TODO =============
 
         return gene_exp

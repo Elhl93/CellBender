@@ -21,7 +21,7 @@ LOW_UMI_CUTOFF = 15
 TOTAL_DROPLET_DEFAULT = 25000
 
 # Fraction of the data used for training (versus testing).
-TRAINING_FRACTION = 1.
+TRAINING_FRACTION = 0.9
 
 # Size of minibatch by default.
 DEFAULT_BATCH_SIZE = 128
@@ -31,4 +31,4 @@ FRACTION_EMPTIES = 0.5
 
 # Prior mean and std in log space for alpha0, the Dirichlet precision for cells.
 ALPHA0_PRIOR_LOC = 7.
-ALPHA0_PRIOR_SCALE = 4.
+ALPHA0_PRIOR_SCALE = 2.

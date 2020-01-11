@@ -64,7 +64,7 @@ class Posterior(ABC):
                                                       batch_size=500,
                                                       shuffle=False)
 
-        self._encodings = {'z': [], 'd': [], 'p': [], 'alpha0': []}
+        self._encodings = {'z': [], 'd': [], 'p': [], 'alpha0': [], 'epsilon': []}
 
         for data in data_loader:
             # Get latent encodings. (z, d, p)
@@ -76,8 +76,10 @@ class Posterior(ABC):
                                         .detach().exp().cpu().numpy())
             self._encodings['p'].append(enc['p_y']
                                         .detach().sigmoid().cpu().numpy())
-            self._encodings['alpha0'].append(enc['alpha0']['loc']
+            self._encodings['alpha0'].append(enc['alpha0']
                                              .detach().exp().cpu().numpy())
+            self._encodings['epsilon'].append(enc['epsilon']
+                                              .detach().cpu().numpy())
 
         # Concatenate lists.
         for key, value_list in self._encodings.items():
@@ -409,7 +411,7 @@ class ProbPosterior(Posterior):
         z_map = enc['z']['loc']
 
         chi_map = self.vi_model.decoder.forward(z_map)
-        alpha0_map = enc['alpha0']['loc']
+        alpha0_map = enc['alpha0']
         alpha_map = chi_map * alpha0_map.unsqueeze(-1)
 
         y = (enc['p_y'] > 0).float()
@@ -417,8 +419,8 @@ class ProbPosterior(Posterior):
                                  scale=pyro.param('d_empty_scale')).mean
         d_cell = dist.LogNormal(loc=enc['d_loc'],
                                 scale=pyro.param('d_cell_scale')).mean
-
-        epsilon = torch.ones_like(y).clone()  # TODO
+        epsilon = enc['epsilon']
+        # epsilon = torch.ones_like(y).clone()  # TODO
 
         # Calculate MAP estimates of mu and lambda.
         mu_map = (epsilon.unsqueeze(-1) * y.unsqueeze(-1)
@@ -457,7 +459,7 @@ class ProbPosterior(Posterior):
         z = dist.Normal(loc=enc['z']['loc'], scale=enc['z']['scale']).sample()
 
         chi_sample = self.vi_model.decoder.forward(z)
-        alpha0_sample = dist.LogNormal(loc=enc['alpha0']['loc'],
+        alpha0_sample = dist.LogNormal(loc=enc['alpha0'],
                                        scale=0.1).sample()
         alpha_sample = chi_sample * alpha0_sample.unsqueeze(-1)
 
@@ -466,9 +468,9 @@ class ProbPosterior(Posterior):
                                  scale=pyro.param('d_empty_scale')).sample()
         d_cell = dist.LogNormal(loc=enc['d_loc'],
                                 scale=pyro.param('d_cell_scale')).sample()
-        # epsilon = dist.Gamma(enc['epsilon_loc'] * self.vi_model.epsilon_param,
-        #                      self.vi_model.epsilon_param).sample()
-        epsilon = torch.ones_like(y).clone()  # TODO
+        epsilon = dist.Gamma(enc['epsilon'] * self.vi_model.epsilon_prior,
+                             self.vi_model.epsilon_prior).sample()
+        # epsilon = torch.ones_like(y).clone()  # TODO
 
         # Calculate MAP estimates of mu and lambda.
         mu_sample = (epsilon.unsqueeze(-1) * y.unsqueeze(-1)

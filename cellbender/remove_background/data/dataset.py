@@ -343,6 +343,8 @@ class SingleCellRNACountsDataset:
             np.mean(np.log1p([self.priors['cell_counts'],
                               self.priors['empty_counts']])).item()
 
+        # TODO: overhaul estimation of d_std.  add estimate of d_empty_std
+
         # Estimate prior for the scale param of LogNormal for d.
         if self.model_name != "simple":
             self.priors['d_std'] = (np.log1p(self.priors['cell_counts'])
@@ -504,6 +506,7 @@ class SingleCellRNACountsDataset:
         d = enc['d']
         p = enc['p']
         alpha0 = enc['alpha0']
+        epsilon = enc['epsilon']
 
         # Estimate the ambient-background-subtracted UMI count matrix.
         if self.model_name != "simple":
@@ -543,7 +546,7 @@ class SingleCellRNACountsDataset:
             inferred_count_matrix=inferred_count_matrix,
             cell_barcode_inds=cell_barcode_inds,
             ambient_expression=ambient_expression,
-            z=z, d=d, p=p, alpha=alpha0,
+            z=z, d=d, p=p, alpha=alpha0, epsilon=epsilon,
             loss=inferred_model.loss)
 
         # Generate filename for filtered matrix output.
@@ -570,6 +573,7 @@ class SingleCellRNACountsDataset:
                 d=d[filtered_inds_of_analyzed_barcodes],
                 p=p[filtered_inds_of_analyzed_barcodes],
                 alpha=alpha0[filtered_inds_of_analyzed_barcodes],
+                epsilon=epsilon[filtered_inds_of_analyzed_barcodes],
                 loss=inferred_model.loss)
 
             # Save barcodes determined to contain cells as _cell_barcodes.csv
@@ -917,11 +921,11 @@ def write_matrix_to_cellranger_h5(
         cell_barcode_inds: Union[np.ndarray, None] = None,
         ambient_expression: Union[np.ndarray, None] = None,
         rho: Union[np.ndarray, None] = None,
-        phi: Union[np.ndarray, None] = None,
         z: Union[np.ndarray, None] = None,
         d: Union[np.ndarray, None] = None,
         p: Union[np.ndarray, None] = None,
         alpha: Union[np.ndarray, None] = None,
+        epsilon: Union[np.ndarray, None] = None,
         loss: Union[Dict, None] = None) -> bool:
     """Write count matrix data to output HDF5 file using CellRanger format.
 
@@ -936,7 +940,7 @@ def write_matrix_to_cellranger_h5(
         ambient_expression: Vector of gene expression of the ambient RNA
             background counts that contaminate cell counts.
         rho: Hyperparameters for the contamination fraction distribution.
-        phi: Hyperparameters for the overdispersion distribution.
+        epsilon: Latent encoding of droplet RT efficiency.
         z: Latent encoding of gene expression.
         d: Latent cell size scale factor.
         p: Latent probability that a barcode contains a cell.
@@ -999,8 +1003,8 @@ def write_matrix_to_cellranger_h5(
                 f.create_array(group, "latent_dirichlet_precision", alpha)
             if rho is not None:
                 f.create_array(group, "contamination_fraction_params", rho)
-            # if phi is not None:
-            #     f.create_array(group, "overdispersion_params", phi)
+            if epsilon is not None:
+                f.create_array(group, "latent_RT_efficiency", epsilon)
             if loss is not None:
                 f.create_array(group, "training_elbo_per_epoch",
                                np.array(loss['train']['elbo']))

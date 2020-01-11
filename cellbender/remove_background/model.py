@@ -105,6 +105,8 @@ class RemoveBackgroundPyroModel(nn.Module):
                                  .float().to(self.device))
         self.alpha0_scale_prior = (torch.tensor(consts.ALPHA0_PRIOR_SCALE)
                                    .float().to(self.device))
+        self.flat_alpha = (torch.ones(self.n_genes)
+                           / self.n_genes).float().to(self.device)
 
         if self.model_type != "simple":
 
@@ -127,10 +129,10 @@ class RemoveBackgroundPyroModel(nn.Module):
                                                dtype=np.float32).item()
                                       * torch.ones(torch.Size([]))
                                       .to(self.device))
-            # TODO:
-            self.d_empty_scale_prior = (torch.tensor(0.4).to(self.device))#, #np.array(dataset_obj.priors['d_std'],
-                                                 # dtype=np.float32).item()
-                                        # * torch.ones(torch.Size([])).to(self.device))
+
+            self.d_empty_scale_prior = (np.array(dataset_obj.priors['d_std'],
+                                                 dtype=np.float32).item()
+                                        * torch.ones(torch.Size([])).to(self.device))
 
             self.p_logit_prior = (dataset_obj.priors['cell_logit']
                                   * torch.ones(torch.Size([])).to(self.device))
@@ -250,11 +252,22 @@ class RemoveBackgroundPyroModel(nn.Module):
                                                 scale=self.alpha0_scale_prior)
                                  .expand_by([x.size(0)]))
 
+            # # Obtain alpha1 from the posterior.
+            # alpha1 = pyro.sample("alpha1_passback",
+            #                      NullDist(torch.zeros(1).to(self.device))
+            #                      .expand_by([x.size(0)]))
+
             # Sample d_cell based on priors.
             d_cell = pyro.sample("d_cell",
                                  dist.LogNormal(loc=self.d_cell_loc_prior,
                                                 scale=self.d_cell_scale_prior)
                                  .expand_by([x.size(0)]))
+
+            # print(f"mean d_cell > 1000 is {d_cell[x.sum(dim=-1) > 1000.].mean()}")
+            # print(f"mean d_cell < 1000 is {d_cell[x.sum(dim=-1) < 1000.].mean()}")
+            #
+            # print(f"mean alpha0 > 1000 is {alpha0[x.sum(dim=-1) > 1000.].mean()}")
+            # print(f"mean alpha0 < 1000 is {alpha0[x.sum(dim=-1) < 1000.].mean()}")
 
             # Sample swapping fraction rho.
             if self.include_rho:
@@ -265,11 +278,14 @@ class RemoveBackgroundPyroModel(nn.Module):
                 rho = None
 
             # Sample epsilon based on priors.
-            epsilon = torch.ones_like(alpha0).clone()
-            # epsilon = pyro.sample("epsilon",
-            #                       dist.Gamma(concentration=self.epsilon_prior,
-            #                                  rate=self.epsilon_prior)
-            #                       .expand_by([x.size(0)]))
+            # epsilon = torch.ones_like(alpha0).clone()
+            epsilon = pyro.sample("epsilon",
+                                  dist.Gamma(concentration=self.epsilon_prior,
+                                             rate=self.epsilon_prior)
+                                  .expand_by([x.size(0)]))
+
+            # print(f"mean epsilon > 1000 is {epsilon[x.sum(dim=-1) > 1000.].mean()}")
+            # print(f"mean epsilon < 1000 is {epsilon[x.sum(dim=-1) < 1000.].mean()}")
 
             # If modelling empty droplets:
             if self.include_empties:
@@ -282,8 +298,9 @@ class RemoveBackgroundPyroModel(nn.Module):
 
                 # Sample y, the presence of a real cell, based on p_logit_prior.
                 y = pyro.sample("y",
-                                dist.Bernoulli(logits=self.p_logit_prior * 0.001)  # TODO
+                                dist.Bernoulli(logits=self.p_logit_prior - 100.)  # TODO
                                 .expand_by([x.size(0)]))
+
             else:
                 d_empty = None
                 y = None
@@ -304,6 +321,8 @@ class RemoveBackgroundPyroModel(nn.Module):
                                          rho=rho,
                                          chi_bar=self.avg_gene_expression)
 
+            # alpha = alpha0 * (alpha1 * chi + (1 - alpha1) * self.flat_alpha)
+
             # print(f'alpha range is [{alpha0.min():.0f}, '
             #       f'{alpha0.mean():.0f}, {alpha0.max():.0f}]')
 
@@ -320,22 +339,47 @@ class RemoveBackgroundPyroModel(nn.Module):
             # since we know these droplets by their UMI counts.
             if self.include_empties:
 
+                # with poutine.mask(mask=(y.detach() < 0.5)):
+                #
+                #     with poutine.scale(scale=0.1):
+                #         pyro.sample("empty_alpha0",
+                #                     dist.Normal(loc=alpha0, scale=0.5),
+                #                     obs=self.alpha0_loc_prior.expand(alpha0.size()))
+
                 counts = x.sum(dim=-1, keepdim=False)
                 surely_empty_mask = ((counts < self.empty_UMI_threshold)
                                      .type(torch.BoolTensor).to(self.device))
 
                 with poutine.mask(mask=surely_empty_mask):
 
-                    # # Semi-supervision of ambient expression.
-                    # pyro.sample("obs_empty",
-                    #             dist.Poisson(rate=lam + 1e-10).to_event(1),
-                    #             obs=x.reshape(-1, self.n_genes))
+                    # TODO: try this
+                    with poutine.scale(scale=0.1):
+
+                        if self.include_rho:
+                            r = rho.detach()
+                        else:
+                            r = None
+
+                        # Semi-supervision of ambient expression.
+                        lam = self._calculate_lambda(epsilon=epsilon.detach(),
+                                                     chi_ambient=chi_ambient,
+                                                     d_empty=d_empty,
+                                                     y=torch.zeros_like(d_empty),
+                                                     d_cell=d_cell.detach(),
+                                                     rho=r,
+                                                     chi_bar=self.avg_gene_expression)
+                        pyro.sample("obs_empty",
+                                    dist.Poisson(rate=lam + 1e-10).to_event(1),
+                                    obs=x.reshape(-1, self.n_genes))
 
                     # Semi-supervision of cell probabilities.
                     p_logit_posterior = pyro.sample("p_passback",
                                                     NullDist(torch.zeros(1)
                                                              .to(self.device))
                                                     .expand_by([x.size(0)]))
+
+                    # print(f"mean p_logit_posterior > 1000 is {p_logit_posterior[x.sum(dim=-1) > 1000.].mean()}")
+                    # print(f"mean p_logit_posterior < 1000 is {p_logit_posterior[x.sum(dim=-1) < 1000.].mean()}")
 
                     with poutine.scale(scale=1.):  # TODO: is this whole section doing anything?
 
@@ -366,9 +410,9 @@ class RemoveBackgroundPyroModel(nn.Module):
         # # Initialize variational parameters for alpha0.
         # alpha0_loc = pyro.param("alpha0_loc",
         #                         torch.tensor(consts.ALPHA0_PRIOR_LOC).to(self.device))
-        # alpha0_scale = pyro.param("alpha0_scale",
-        #                           torch.tensor(consts.ALPHA0_PRIOR_SCALE).to(self.device),
-        #                           constraint=constraints.positive)
+        alpha0_scale = pyro.param("alpha0_scale",
+                                  torch.tensor(consts.ALPHA0_PRIOR_SCALE).to(self.device),
+                                  constraint=constraints.positive)
 
         if self.include_empties:
 
@@ -410,6 +454,7 @@ class RemoveBackgroundPyroModel(nn.Module):
             if self.include_rho:
                 pyro.sample("rho", dist.Beta(rho_alpha,
                                              rho_beta).expand_by([x.size(0)]))
+                # TODO: check if the expand_by makes all these rho values the same
 
             # Encode the latent variables from the input gene expression counts.
             if self.include_empties:
@@ -420,15 +465,18 @@ class RemoveBackgroundPyroModel(nn.Module):
                                                      scale=d_empty_scale)
                                       .expand_by([x.size(0)]))
 
-                epsilon = torch.ones(x.shape[0])
-
                 enc = self.encoder.forward(x=x, chi_ambient=chi_ambient)
 
             else:
                 enc = self.encoder.forward(x=x, chi_ambient=None)
 
             # Code specific to models with empty droplets.
-            if self.include_empties:\
+            if self.include_empties:
+
+                # epsilon = torch.ones(x.shape[0])
+                epsilon = pyro.sample("epsilon",
+                                      dist.Gamma(enc['epsilon'] * self.epsilon_prior,
+                                                 self.epsilon_prior))
 
                 # Pass back the inferred p_y to the model.
                 pyro.sample("p_passback", NullDist(enc['p_y'].detach()))  # TODO
@@ -448,8 +496,8 @@ class RemoveBackgroundPyroModel(nn.Module):
 
                     # Sample alpha0 for the barcodes containing cells.
                     pyro.sample("alpha0",
-                                dist.LogNormal(loc=enc['alpha0']['loc'],
-                                               scale=enc['alpha0']['scale']))
+                                dist.LogNormal(loc=enc['alpha0'],
+                                               scale=alpha0_scale))
 
                     # # TODO: testing
                     # # Sample alpha0 for the barcodes containing cells.
@@ -461,6 +509,10 @@ class RemoveBackgroundPyroModel(nn.Module):
                 prob = enc['p_y'].sigmoid()  # Logits to probability
                 d_cell_loc_gated = (prob * enc['d_loc'] + (1 - prob)
                                     * self.d_cell_loc_prior)
+
+                # print(f'prob.shape is {prob.shape}')
+                # print(f"enc['other']['d_loc'].shape is {enc['other']['d_loc'].shape}")
+                # print(f'd_cell_loc_gated.shape is {d_cell_loc_gated.shape}')
 
                 # Sample d based on the encoding.
                 pyro.sample("d_cell", dist.LogNormal(loc=d_cell_loc_gated,
@@ -480,8 +532,8 @@ class RemoveBackgroundPyroModel(nn.Module):
 
                 # Sample alpha0 for the barcodes containing cells.
                 pyro.sample("alpha0",
-                            dist.LogNormal(loc=enc['alpha0']['loc'],
-                                           scale=enc['alpha0']['scale']))
+                            dist.LogNormal(loc=enc['alpha0'],
+                                           scale=alpha0_scale))
 
     def store_vars(self, x, params=None):
         """Temp method to store params for inspection.
