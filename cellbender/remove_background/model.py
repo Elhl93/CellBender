@@ -158,14 +158,14 @@ class RemoveBackgroundPyroModel(nn.Module):
         print(f'log_p(c=2000 | full) = {dist.LogNormal(self.d_cell_loc_prior, self.d_cell_scale_prior).log_prob(torch.Tensor([2000.])).item()}')
         print(f'log_p(c=2000 | empty) = {dist.LogNormal(self.d_empty_loc_prior, self.d_empty_scale_prior).log_prob(torch.Tensor([2000.])).item()}')
 
-    def _calculate_lambda(self,
-                          epsilon: torch.Tensor,
-                          chi_ambient: torch.Tensor,
-                          d_empty: torch.Tensor,
-                          y: Union[torch.Tensor, None] = None,
-                          d_cell: Union[torch.Tensor, None] = None,
-                          rho: Union[torch.Tensor, None] = None,
-                          chi_bar: Union[torch.Tensor, None] = None):
+    def calculate_lambda(self,
+                         epsilon: torch.Tensor,
+                         chi_ambient: torch.Tensor,
+                         d_empty: torch.Tensor,
+                         y: Union[torch.Tensor, None] = None,
+                         d_cell: Union[torch.Tensor, None] = None,
+                         rho: Union[torch.Tensor, None] = None,
+                         chi_bar: Union[torch.Tensor, None] = None):
         """Calculate noise rate based on the model."""
 
         if self.model_type == "simple" or self.model_type == "ambient":
@@ -177,9 +177,14 @@ class RemoveBackgroundPyroModel(nn.Module):
                    + d_empty.unsqueeze(-1)) * chi_bar
 
         elif self.model_type == "full":
-            lam = (d_empty.unsqueeze(-1) * chi_ambient.unsqueeze(0)
-                   + (rho.unsqueeze(-1) * y.unsqueeze(-1)
-                      * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
+            # lam = (d_empty.unsqueeze(-1) * chi_ambient.unsqueeze(0)
+            #        + (rho.unsqueeze(-1) * y.unsqueeze(-1)
+            #           * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
+            #           + d_empty.unsqueeze(-1)) * chi_bar)
+
+            lam = ((1. - rho.unsqueeze(-1)) * d_empty.unsqueeze(-1) * chi_ambient
+                   + rho.unsqueeze(-1)
+                   * (y.unsqueeze(-1) * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
                       + d_empty.unsqueeze(-1)) * chi_bar)
         else:
             raise NotImplementedError(f"model_type was set to {self.model_type}, "
@@ -187,12 +192,12 @@ class RemoveBackgroundPyroModel(nn.Module):
 
         return lam
 
-    def _calculate_mu(self,
-                      epsilon: torch.Tensor,
-                      d_cell: torch.Tensor,
-                      chi: torch.Tensor,
-                      y: Union[torch.Tensor, None] = None,
-                      rho: Union[torch.Tensor, None] = None):
+    def calculate_mu(self,
+                     epsilon: torch.Tensor,
+                     d_cell: torch.Tensor,
+                     chi: torch.Tensor,
+                     y: Union[torch.Tensor, None] = None,
+                     rho: Union[torch.Tensor, None] = None):
         """Calculate mean expression based on the model."""
 
         if self.model_type == 'simple':
@@ -203,7 +208,7 @@ class RemoveBackgroundPyroModel(nn.Module):
                   * d_cell.unsqueeze(-1) * chi)
 
         elif self.model_type == 'swapping' or self.model_type == 'full':
-            mu = ((1 - rho.unsqueeze(-1))
+            mu = ((1. - rho.unsqueeze(-1))
                   * y.unsqueeze(-1) * epsilon.unsqueeze(-1)
                   * d_cell.unsqueeze(-1) * chi)
 
@@ -274,6 +279,8 @@ class RemoveBackgroundPyroModel(nn.Module):
                 rho = pyro.sample("rho", dist.Beta(self.rho_alpha_prior,
                                                    self.rho_beta_prior)
                                   .expand_by([x.size(0)]))
+                # rho = pyro.sample("rho", dist.Beta(self.rho_alpha_prior,
+                #                                    self.rho_beta_prior))  # TODO: check
             else:
                 rho = None
 
@@ -306,20 +313,20 @@ class RemoveBackgroundPyroModel(nn.Module):
                 y = None
 
             # Calculate the mean gene expression counts (for each barcode).
-            mu_cell = self._calculate_mu(epsilon=epsilon,
-                                         d_cell=d_cell,
-                                         chi=chi,
-                                         y=y,
-                                         rho=rho)
+            mu_cell = self.calculate_mu(epsilon=epsilon,
+                                        d_cell=d_cell,
+                                        chi=chi,
+                                        y=y,
+                                        rho=rho)
 
             # Calculate the background rate parameter (for each barcode).
-            lam = self._calculate_lambda(epsilon=epsilon,
-                                         chi_ambient=chi_ambient,
-                                         d_empty=d_empty,
-                                         y=y,
-                                         d_cell=d_cell,
-                                         rho=rho,
-                                         chi_bar=self.avg_gene_expression)
+            lam = self.calculate_lambda(epsilon=epsilon,
+                                        chi_ambient=chi_ambient,
+                                        d_empty=d_empty,
+                                        y=y,
+                                        d_cell=d_cell,
+                                        rho=rho,
+                                        chi_bar=self.avg_gene_expression)
 
             # alpha = alpha0 * (alpha1 * chi + (1 - alpha1) * self.flat_alpha)
 
@@ -361,13 +368,13 @@ class RemoveBackgroundPyroModel(nn.Module):
                             r = None
 
                         # Semi-supervision of ambient expression.
-                        lam = self._calculate_lambda(epsilon=epsilon.detach(),
-                                                     chi_ambient=chi_ambient,
-                                                     d_empty=d_empty,
-                                                     y=torch.zeros_like(d_empty),
-                                                     d_cell=d_cell.detach(),
-                                                     rho=r,
-                                                     chi_bar=self.avg_gene_expression)
+                        lam = self.calculate_lambda(epsilon=epsilon.detach(),
+                                                    chi_ambient=chi_ambient,
+                                                    d_empty=d_empty,
+                                                    y=torch.zeros_like(d_empty),
+                                                    d_cell=d_cell.detach(),
+                                                    rho=r,
+                                                    chi_bar=self.avg_gene_expression)
                         pyro.sample("obs_empty",
                                     dist.Poisson(rate=lam + 1e-10).to_event(1),
                                     obs=x.reshape(-1, self.n_genes))
@@ -448,13 +455,11 @@ class RemoveBackgroundPyroModel(nn.Module):
         with pyro.plate("data", x.size(0),
                         use_cuda=self.use_cuda, device=self.device):
 
-            # TODO: epsilon inference
-
             # Sample swapping fraction rho.
             if self.include_rho:
-                pyro.sample("rho", dist.Beta(rho_alpha,
-                                             rho_beta).expand_by([x.size(0)]))
-                # TODO: check if the expand_by makes all these rho values the same
+                rho = pyro.sample("rho", dist.Beta(rho_alpha,
+                                                   rho_beta).expand_by([x.size(0)]))
+                # rho = pyro.sample("rho", dist.Beta(rho_alpha, rho_beta))  # TODO
 
             # Encode the latent variables from the input gene expression counts.
             if self.include_empties:
@@ -472,11 +477,6 @@ class RemoveBackgroundPyroModel(nn.Module):
 
             # Code specific to models with empty droplets.
             if self.include_empties:
-
-                # epsilon = torch.ones(x.shape[0])
-                epsilon = pyro.sample("epsilon",
-                                      dist.Gamma(enc['epsilon'] * self.epsilon_prior,
-                                                 self.epsilon_prior))
 
                 # Pass back the inferred p_y to the model.
                 pyro.sample("p_passback", NullDist(enc['p_y'].detach()))  # TODO
@@ -498,6 +498,11 @@ class RemoveBackgroundPyroModel(nn.Module):
                     pyro.sample("alpha0",
                                 dist.LogNormal(loc=enc['alpha0'],
                                                scale=alpha0_scale))
+
+                    # epsilon = torch.ones(x.shape[0])
+                    epsilon = pyro.sample("epsilon",
+                                          dist.Gamma(enc['epsilon'] * self.epsilon_prior,
+                                                     self.epsilon_prior))
 
                     # # TODO: testing
                     # # Sample alpha0 for the barcodes containing cells.
@@ -556,13 +561,13 @@ class RemoveBackgroundPyroModel(nn.Module):
                     self.loss['params'][p + ':mean'] = []
                     self.loss['params'][p + ':std'] = []
                 rho = trace.nodes['rho']['value'] if self.model_type != 'ambient' else None
-                lam = self._calculate_lambda(epsilon=torch.tensor(1.).to(self.device),
-                                             chi_ambient=pyro.param("chi_ambient"),
-                                             d_empty=trace.nodes['d_empty']['value'],
-                                             y=trace.nodes['y']['value'],
-                                             d_cell=trace.nodes['d_cell']['value'],
-                                             rho=rho,
-                                             chi_bar=self.avg_gene_expression)
+                lam = self.calculate_lambda(epsilon=torch.tensor(1.).to(self.device),
+                                            chi_ambient=pyro.param("chi_ambient"),
+                                            d_empty=trace.nodes['d_empty']['value'],
+                                            y=trace.nodes['y']['value'],
+                                            d_cell=trace.nodes['d_cell']['value'],
+                                            rho=rho,
+                                            chi_bar=self.avg_gene_expression)
                 val_mean = lam.mean().detach().cpu().numpy().item()
                 val_std = lam.std().detach().cpu().numpy().item()
                 self.loss['params'][p + ':mean'].append(val_mean)

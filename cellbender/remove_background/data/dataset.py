@@ -547,6 +547,7 @@ class SingleCellRNACountsDataset:
             cell_barcode_inds=cell_barcode_inds,
             ambient_expression=ambient_expression,
             z=z, d=d, p=p, alpha=alpha0, epsilon=epsilon,
+            lambda_mult=self.lambda_multiplier,
             loss=inferred_model.loss)
 
         # Generate filename for filtered matrix output.
@@ -574,6 +575,7 @@ class SingleCellRNACountsDataset:
                 p=p[filtered_inds_of_analyzed_barcodes],
                 alpha=alpha0[filtered_inds_of_analyzed_barcodes],
                 epsilon=epsilon[filtered_inds_of_analyzed_barcodes],
+                lambda_mult=self.lambda_multiplier,
                 loss=inferred_model.loss)
 
             # Save barcodes determined to contain cells as _cell_barcodes.csv
@@ -926,6 +928,7 @@ def write_matrix_to_cellranger_h5(
         p: Union[np.ndarray, None] = None,
         alpha: Union[np.ndarray, None] = None,
         epsilon: Union[np.ndarray, None] = None,
+        lambda_mult: Union[float, None] = None,
         loss: Union[Dict, None] = None) -> bool:
     """Write count matrix data to output HDF5 file using CellRanger format.
 
@@ -945,6 +948,8 @@ def write_matrix_to_cellranger_h5(
         d: Latent cell size scale factor.
         p: Latent probability that a barcode contains a cell.
         alpha: Latent Dirichlet precision parameter for each cell.
+        lambda_mult: Factor by which background rate parameter is multiplied
+            during posterior generation.
         loss: Training and test error, as ELBO, for each epoch.
 
     Note:
@@ -1005,6 +1010,8 @@ def write_matrix_to_cellranger_h5(
                 f.create_array(group, "contamination_fraction_params", rho)
             if epsilon is not None:
                 f.create_array(group, "latent_RT_efficiency", epsilon)
+            if lambda_mult is not None:
+                f.create_array(group, "lambda_multiplier", lambda_mult)
             if loss is not None:
                 f.create_array(group, "training_elbo_per_epoch",
                                np.array(loss['train']['elbo']))

@@ -388,8 +388,11 @@ def sample_from_dirichlet_model(num: int,
                                 y: int,
                                 chi_ambient: np.ndarray,
                                 eps_param: float,
-                                random_seed: int = 0) -> Tuple[np.ndarray,
-                                                               np.ndarray]:
+                                random_seed: int = 0,
+                                include_swapping: bool = False,
+                                rho_alpha: float = 3,
+                                rho_beta: float = 80) -> Tuple[np.ndarray,
+                                                                         np.ndarray]:
     """Draw samples of cell expression profiles using the Dirichlet-Poisson,
     Poisson sum model.
 
@@ -406,6 +409,9 @@ def sample_from_dirichlet_model(num: int,
         eps_param: Parameter for gamma distribution of the epsilon droplet
             efficiency factor ~ Gamma(eps_param, 1/eps_param), i.e. mean is 1.
         random_seed: Seed a random number generator.
+        include_swapping: Whether to include swapping in the model.
+        rho_alpha: Beta distribution param alpha for swapping fraction.
+        rho_beta: Beta distribution param beta for swapping fraction.
 
     Returns:
         Tuple of (c_real, c_bkg)
@@ -445,13 +451,36 @@ def sample_from_dirichlet_model(num: int,
     # Draw d ~ LogNormal(d_mu, d_sigma)
     v = rng.lognormal(mean=v_mu, sigma=v_sigma, size=num)
 
+    # Draw rho ~ Beta(rho_alpha, rho_beta)
+    rho = rng.beta(a=rho_alpha, b=rho_beta, size=num)
+
+    # print(f'eps.shape is {epsilon.shape}')
+    # print(f'd.shape is {d.shape}')
+    # print(f'chi.shape is {chi.shape}')
+    # print(f'rho.shape is {rho.shape}')
+
+    mu = _calculate_mu(model_type='ambient' if not include_swapping else 'full',
+                       epsilon=torch.Tensor(epsilon),
+                       d_cell=torch.Tensor(d),
+                       chi=torch.Tensor(chi),
+                       y=torch.ones(d.shape) * y,
+                       rho=torch.Tensor(rho)).numpy()
+
     # Draw cell counts ~ Poisson(y * epsilon * d * chi)
-    c_real = rng.poisson(lam=(y * epsilon * d * chi.transpose()).transpose(),
+    c_real = rng.poisson(lam=mu,
                          size=(num, chi_ambient.size))
 
+    lam = _calculate_lambda(model_type='ambient' if not include_swapping else 'full',
+                            epsilon=torch.Tensor(epsilon),
+                            chi_ambient=torch.Tensor(chi_ambient),
+                            d_cell=torch.Tensor(d),
+                            d_empty=torch.Tensor(v),
+                            y=torch.ones(d.shape) * y,
+                            rho=torch.Tensor(rho),
+                            chi_bar=torch.Tensor(chi_ambient)).numpy()
+
     # Draw empty counts ~ Poisson(epsilon * v * chi_ambient)
-    c_bkg = rng.poisson(lam=(np.expand_dims(epsilon * v, axis=1)
-                             * chi_ambient),
+    c_bkg = rng.poisson(lam=lam,
                         size=(num, chi_ambient.size))
 
     # Output observed counts are the sum, but return them separately.
@@ -477,15 +506,16 @@ def _calculate_lambda(model_type: str,
                + d_empty.unsqueeze(-1)) * chi_bar
 
     elif model_type == "full":
-        lam = (d_empty.unsqueeze(-1) * chi_ambient.unsqueeze(0)
-               + (rho.unsqueeze(-1) * y.unsqueeze(-1)
-                  * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
+        lam = ((1 - rho.unsqueeze(-1)) * d_empty.unsqueeze(-1) * chi_ambient.unsqueeze(0)
+               + rho.unsqueeze(-1)
+               * (y.unsqueeze(-1) * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
                   + d_empty.unsqueeze(-1)) * chi_bar)
     else:
         raise NotImplementedError(f"model_type was set to {model_type}, "
                                   f"which is not implemented.")
 
     return lam
+
 
 def _calculate_mu(model_type: str,
                   epsilon: torch.Tensor,

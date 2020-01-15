@@ -107,6 +107,8 @@ class Posterior(ABC):
         Barcode numbering is relative to the tensor passed in.
         """
 
+        # TODO: speed up by keeping it a torch tensor as long as possible
+
         if chunk_dense_counts.dtype != np.int:
 
             if self.dtype == np.uint32:
@@ -273,7 +275,7 @@ class ProbPosterior(Posterior):
 
         data_loader = self.dataset_obj.get_dataloader(use_cuda=self.use_cuda,
                                                       analyzed_bcs_only=analyzed_bcs_only,
-                                                      batch_size=100,
+                                                      batch_size=50,  # 100 overflowed once
                                                       shuffle=False)
 
         chi_ambient = pyro.param("chi_ambient")
@@ -347,7 +349,7 @@ class ProbPosterior(Posterior):
             # Compute the de-noised count matrix given the MAP estimates.
             dense_counts_torch = self._true_counts_from_params(data,
                                                                mu_map,
-                                                               lambda_map,
+                                                               lambda_map * self.lambda_multiplier,
                                                                alpha_map)
 
             dense_counts = dense_counts_torch.detach().cpu().numpy()
@@ -422,11 +424,28 @@ class ProbPosterior(Posterior):
         epsilon = enc['epsilon']
         # epsilon = torch.ones_like(y).clone()  # TODO
 
+        if self.vi_model.include_rho:
+            rho = pyro.param("rho_alpha") / pyro.param("rho_beta")
+        else:
+            rho = None
+
         # Calculate MAP estimates of mu and lambda.
-        mu_map = (epsilon.unsqueeze(-1) * y.unsqueeze(-1)
-                  * d_cell.unsqueeze(-1) * chi_map) + 1e-10
-        lambda_map = (epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1)
-                      * chi_ambient) + 1e-10
+        mu_map = self.vi_model.calculate_mu(epsilon=epsilon,
+                                            d_cell=d_cell,
+                                            chi=chi_map,
+                                            y=y,
+                                            rho=rho)
+        lambda_map = self.vi_model.calculate_lambda(epsilon=epsilon,
+                                                    chi_ambient=chi_ambient,
+                                                    d_empty=d_empty,
+                                                    y=y,
+                                                    d_cell=d_cell,
+                                                    rho=rho,
+                                                    chi_bar=self.vi_model.avg_gene_expression)
+        # mu_map = (epsilon.unsqueeze(-1) * y.unsqueeze(-1)
+        #           * d_cell.unsqueeze(-1) * chi_map) + 1e-10
+        # lambda_map = (epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1)
+        #               * chi_ambient) + 1e-10
 
         return mu_map, lambda_map, alpha_map
 
@@ -460,7 +479,7 @@ class ProbPosterior(Posterior):
 
         chi_sample = self.vi_model.decoder.forward(z)
         alpha0_sample = dist.LogNormal(loc=enc['alpha0'],
-                                       scale=0.1).sample()
+                                       scale=pyro.param("alpha0_scale")).sample()
         alpha_sample = chi_sample * alpha0_sample.unsqueeze(-1)
 
         y = dist.Bernoulli(logits=enc['p_y']).sample()
@@ -472,11 +491,29 @@ class ProbPosterior(Posterior):
                              self.vi_model.epsilon_prior).sample()
         # epsilon = torch.ones_like(y).clone()  # TODO
 
+        if self.vi_model.include_rho:
+            rho = dist.Beta(pyro.param("rho_alpha"),
+                            pyro.param("rho_beta")).expand_by([d_cell.size(0)]).sample()
+        else:
+            rho = None
+
         # Calculate MAP estimates of mu and lambda.
-        mu_sample = (epsilon.unsqueeze(-1) * y.unsqueeze(-1)
-                     * d_cell.unsqueeze(-1) * chi_sample) + 1e-10
-        lambda_sample = (epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1)
-                         * chi_ambient) + 1e-10
+        mu_sample = self.vi_model.calculate_mu(epsilon=epsilon,
+                                               d_cell=d_cell,
+                                               chi=chi_sample,
+                                               y=y,
+                                               rho=rho)
+        lambda_sample = self.vi_model.calculate_lambda(epsilon=epsilon,
+                                                       chi_ambient=chi_ambient,
+                                                       d_empty=d_empty,
+                                                       y=y,
+                                                       d_cell=d_cell,
+                                                       rho=rho,
+                                                       chi_bar=self.vi_model.avg_gene_expression)
+        # mu_sample = (epsilon.unsqueeze(-1) * y.unsqueeze(-1)
+        #              * d_cell.unsqueeze(-1) * chi_sample) + 1e-10
+        # lambda_sample = (epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1)
+        #                  * chi_ambient) + 1e-10
 
         return mu_sample, lambda_sample, alpha_sample
 
@@ -509,16 +546,19 @@ class ProbPosterior(Posterior):
         # shape (batch_cells, n_genes, max_noise_counts)
         noise_count_tensor = torch.arange(start=0,
                                           end=max_noise_counts + 1) \
-                                 .expand([data.shape[0], data.shape[1], -1]) \
-                                 .float().to(device=self.vi_model.device) + 1e-10
+                                  .expand([data.shape[0], data.shape[1], -1]) \
+                                  .float().to(device=self.vi_model.device) + 1e-10
 
         # Compute probabilities of each number of noise counts.
+        logits = (mu_est.log() - alpha_est.log()).unsqueeze(-1)
         prob_tensor = (dist.Poisson(lambda_est.unsqueeze(-1))
                        .log_prob(noise_count_tensor)
                        + dist.NegativeBinomial(total_count=alpha_est.unsqueeze(-1),
-                                               logits=(mu_est / alpha_est)
-                                               .log().unsqueeze(-1))
+                                               logits=logits)
                        .log_prob(data.unsqueeze(-1) - noise_count_tensor))
+
+        # TODO: this helps with the y=0, but posterior counts != 0 issue?  why?
+        prob_tensor[mu_est == 0] = 0.
 
         # Find the most probable number of noise counts per cell per gene.
         noise_count_map = torch.argmax(prob_tensor,

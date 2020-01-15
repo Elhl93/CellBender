@@ -463,12 +463,12 @@ class EncodeNonZLatents(nn.Module):
         self.linears = nn.ModuleList([nn.Linear(3 + self.n_genes,
                                                 hidden_dims[0])])
         with torch.no_grad():
-            self.linears[-1].weight[0][0] = self.INITIAL_WEIGHT_FOR_LOG_COUNTS
+            self.linears[-1].weight[0][0] = 1.  # self.INITIAL_WEIGHT_FOR_LOG_COUNTS  # TODO
         for i in range(1, len(hidden_dims)):  # Second hidden layer onward
             self.linears.append(nn.Linear(hidden_dims[i-1], hidden_dims[i]))
             # Initialize p so that it starts out based (almost) on UMI counts.
             with torch.no_grad():
-                self.linears[-1].weight[0][0] = self.INITIAL_WEIGHT_FOR_LOG_COUNTS
+                self.linears[-1].weight[0][0] = 1.  # self.INITIAL_WEIGHT_FOR_LOG_COUNTS  # TODO
         self.output = nn.Linear(hidden_dims[-1], self.output_dim)
         # Initialize p to be a sigmoid function of UMI counts.
         with torch.no_grad():
@@ -537,7 +537,7 @@ class EncodeNonZLatents(nn.Module):
             cells = (log_sum > self.log_count_crossover).squeeze()
             cell_median = out[cells, 0].median().item()
             empty_median = out[~cells, 0].median().item()
-            self.offset['logit_p'] = empty_median + (cell_median - empty_median) * 3. / 4.
+            self.offset['logit_p'] = empty_median + (cell_median - empty_median) * 9. / 10.  # 3. / 4.
 
             # Heuristic for initialization of d.
             self.offset['d'] = out[cells, 1].median().item()
