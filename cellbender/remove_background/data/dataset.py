@@ -68,7 +68,7 @@ class SingleCellRNACountsDataset:
                  model_name: str = None,
                  gene_blacklist: List[int] = [],
                  low_count_threshold: int = 30,
-                 lambda_multiplier: float = 1.):
+                 lambda_multiplier: List[float] = [1.]):
         assert input_file is not None, "Attempting to load data, but no " \
                                        "input file was specified."
         self.input_file = input_file
@@ -207,6 +207,9 @@ class SingleCellRNACountsDataset:
             raise AssertionError("All genes with nonzero counts have been "
                                  "blacklisted.  Examine the dataset and "
                                  "reduce the blacklist.")
+
+        logging.info(f"Including {self.analyzed_gene_inds.size} genes that have"
+                     f" nonzero counts.")
 
         # Estimate priors on cell size and 'empty' droplet size.
         self.priors['cell_counts'], self.priors['empty_counts'] = \
@@ -387,8 +390,7 @@ class SingleCellRNACountsDataset:
             # Return the count matrix for selected barcodes and genes.
             trimmed_bc_matrix = self.data['matrix'][self.analyzed_barcode_inds,
                                                     :].tocsc()
-            trimmed_matrix = trimmed_bc_matrix[:,
-                                               self.analyzed_gene_inds].tocsr()
+            trimmed_matrix = trimmed_bc_matrix[:, self.analyzed_gene_inds].tocsr()
             return trimmed_matrix
 
         else:
@@ -404,8 +406,7 @@ class SingleCellRNACountsDataset:
             # Return the count matrix for selected barcodes and genes.
             trimmed_bc_matrix = self.data['matrix'][self.empty_barcode_inds,
                                                     :].tocsc()
-            trimmed_matrix = trimmed_bc_matrix[:,
-                                               self.analyzed_gene_inds].tocsr()
+            trimmed_matrix = trimmed_bc_matrix[:, self.analyzed_gene_inds].tocsr()
             return trimmed_matrix
 
         else:
@@ -420,8 +421,7 @@ class SingleCellRNACountsDataset:
 
             # Return the count matrix for selected barcodes and genes.
             trimmed_bc_matrix = self.data['matrix'].tocsc()
-            trimmed_matrix = trimmed_bc_matrix[:,
-                                               self.analyzed_gene_inds].tocsr()
+            trimmed_matrix = trimmed_bc_matrix[:, self.analyzed_gene_inds].tocsr()
             return trimmed_matrix
 
         else:
@@ -440,8 +440,6 @@ class SingleCellRNACountsDataset:
             use_cuda: Whether to load data into GPU memory.
             batch_size: Size of minibatch of data yielded by dataloader.
             shuffle: Whether dataloader should shuffle the data.
-            drop_last: Whether the dataloader should exclude the last batch of
-                data that has a different batch size.
             analyzed_bcs_only: Only include the barcodes that have been
                 analyzed, not the surely empty droplets.
 
@@ -495,13 +493,13 @@ class SingleCellRNACountsDataset:
         # Create posterior.
         self.posterior = ProbPosterior(dataset_obj=self,
                                        vi_model=inferred_model,
-                                       lambda_multiplier=self.lambda_multiplier)
+                                       lambda_multiplier=self.lambda_multiplier[0])
 
         # TODO:
         np.save(output_file[:-3] + '_debug_params.npy', inferred_model.loss['params'])
 
         # Encoded values of latent variables.
-        enc = self.posterior.encodings
+        enc = self.posterior.latents
         z = enc['z']
         d = enc['d']
         p = enc['p']
@@ -538,45 +536,100 @@ class SingleCellRNACountsDataset:
             cell_barcode_inds = self.analyzed_barcode_inds
             filtered_inds_of_analyzed_barcodes = np.arange(0, d.size)
 
-        # Write to output file.
-        write_succeeded = write_matrix_to_cellranger_h5(
-            output_file=output_file,
-            gene_names=self.data['gene_names'],
-            barcodes=self.data['barcodes'],
-            inferred_count_matrix=inferred_count_matrix,
-            cell_barcode_inds=cell_barcode_inds,
-            ambient_expression=ambient_expression,
-            z=z, d=d, p=p, alpha=alpha0, epsilon=epsilon,
-            lambda_mult=self.lambda_multiplier,
-            loss=inferred_model.loss)
-
-        # Generate filename for filtered matrix output.
-        file_dir, file_base = os.path.split(output_file)
-        file_name = os.path.splitext(os.path.basename(file_base))[0]
-        filtered_output_file = os.path.join(file_dir,
-                                            file_name + "_filtered.h5")
-
-        # Write filtered matrix (cells only) to output file.
-        if self.model_name != "simple":
-            cell_barcode_inds = \
-                self.analyzed_barcode_inds[filtered_inds_of_analyzed_barcodes]
-
-            cell_barcodes = self.data['barcodes'][cell_barcode_inds]
-
-            write_matrix_to_cellranger_h5(
-                output_file=filtered_output_file,
+        # Write to output file, for each lambda specified by user.
+        if len(self.lambda_multiplier) == 1:
+            write_succeeded = write_matrix_to_cellranger_h5(
+                output_file=output_file,
                 gene_names=self.data['gene_names'],
-                barcodes=cell_barcodes,
-                inferred_count_matrix=inferred_count_matrix[cell_barcode_inds, :],
-                cell_barcode_inds=None,
+                barcodes=self.data['barcodes'],
+                inferred_count_matrix=inferred_count_matrix,
+                cell_barcode_inds=cell_barcode_inds,
                 ambient_expression=ambient_expression,
-                z=z[filtered_inds_of_analyzed_barcodes, :],
-                d=d[filtered_inds_of_analyzed_barcodes],
-                p=p[filtered_inds_of_analyzed_barcodes],
-                alpha=alpha0[filtered_inds_of_analyzed_barcodes],
-                epsilon=epsilon[filtered_inds_of_analyzed_barcodes],
-                lambda_mult=self.lambda_multiplier,
+                z=z, d=d, p=p, alpha=alpha0, epsilon=epsilon,
+                rho=cellbender.remove_background.model.get_rho(),
+                lambda_mult=self.lambda_multiplier[0],
                 loss=inferred_model.loss)
+
+            # Generate filename for filtered matrix output.
+            file_dir, file_base = os.path.split(output_file)
+            file_name = os.path.splitext(os.path.basename(file_base))[0]
+            filtered_output_file = os.path.join(file_dir, file_name + "_filtered.h5")
+
+            # Write filtered matrix (cells only) to output file.
+            if self.model_name != "simple":
+                cell_barcode_inds = \
+                    self.analyzed_barcode_inds[filtered_inds_of_analyzed_barcodes]
+
+                cell_barcodes = self.data['barcodes'][cell_barcode_inds]
+
+                write_matrix_to_cellranger_h5(
+                    output_file=filtered_output_file,
+                    gene_names=self.data['gene_names'],
+                    barcodes=cell_barcodes,
+                    inferred_count_matrix=inferred_count_matrix[cell_barcode_inds, :],
+                    cell_barcode_inds=None,
+                    ambient_expression=ambient_expression,
+                    z=z[filtered_inds_of_analyzed_barcodes, :],
+                    d=d[filtered_inds_of_analyzed_barcodes],
+                    p=p[filtered_inds_of_analyzed_barcodes],
+                    alpha=alpha0[filtered_inds_of_analyzed_barcodes],
+                    epsilon=epsilon[filtered_inds_of_analyzed_barcodes],
+                    rho=cellbender.remove_background.model.get_rho(),
+                    lambda_mult=self.lambda_multiplier[0],
+                    loss=inferred_model.loss)
+
+        else:
+
+            file_dir, file_base = os.path.split(output_file)
+            file_name = os.path.splitext(os.path.basename(file_base))[0]
+
+            for lam_mult in self.lambda_multiplier:
+
+                # Re-compute posterior counts for each new lambda.
+                self.posterior.lambda_multiplier = lam_mult
+                self.posterior._get_mean()
+                inferred_count_matrix = self.posterior.mean
+
+                # Create an output filename for this lambda value.
+                temp_output_filename = os.path.join(file_dir, file_name + f"_lambda_{lam_mult}.h5")
+
+                write_succeeded = write_matrix_to_cellranger_h5(
+                    output_file=temp_output_filename,
+                    gene_names=self.data['gene_names'],
+                    barcodes=self.data['barcodes'],
+                    inferred_count_matrix=inferred_count_matrix,
+                    cell_barcode_inds=self.analyzed_barcode_inds,
+                    ambient_expression=ambient_expression,
+                    z=z, d=d, p=p, alpha=alpha0, epsilon=epsilon,
+                    rho=cellbender.remove_background.model.get_rho(),
+                    lambda_mult=lam_mult,
+                    loss=inferred_model.loss)
+
+                # Generate filename for filtered matrix output.
+                filtered_output_file = os.path.join(file_dir, file_name + f"_lambda_{lam_mult}_filtered.h5")
+
+                # Write filtered matrix (cells only) to output file.
+                if self.model_name != "simple":
+                    cell_barcode_inds = \
+                        self.analyzed_barcode_inds[filtered_inds_of_analyzed_barcodes]
+
+                    cell_barcodes = self.data['barcodes'][cell_barcode_inds]
+
+                    write_matrix_to_cellranger_h5(
+                        output_file=filtered_output_file,
+                        gene_names=self.data['gene_names'],
+                        barcodes=cell_barcodes,
+                        inferred_count_matrix=inferred_count_matrix[cell_barcode_inds, :],
+                        cell_barcode_inds=None,
+                        ambient_expression=ambient_expression,
+                        z=z[filtered_inds_of_analyzed_barcodes, :],
+                        d=d[filtered_inds_of_analyzed_barcodes],
+                        p=p[filtered_inds_of_analyzed_barcodes],
+                        alpha=alpha0[filtered_inds_of_analyzed_barcodes],
+                        epsilon=epsilon[filtered_inds_of_analyzed_barcodes],
+                        rho=cellbender.remove_background.model.get_rho(),
+                        lambda_mult=self.lambda_multiplier[0],
+                        loss=inferred_model.loss)
 
             # Save barcodes determined to contain cells as _cell_barcodes.csv
             try:
@@ -605,16 +658,17 @@ class SingleCellRNACountsDataset:
                          label='Train')
 
                 # Plot the test error, if there was held-out test data.
-                if len(inferred_model.loss['test']['epoch']) > 0:
-                    plt.plot(inferred_model.loss['test']['epoch'],
-                             inferred_model.loss['test']['elbo'], 'o:',
-                             label='Test')
+                if 'test' in inferred_model.loss.keys():
+                    if len(inferred_model.loss['test']['epoch']) > 0:
+                        plt.plot(inferred_model.loss['test']['epoch'],
+                                 inferred_model.loss['test']['elbo'], 'o:',
+                                 label='Test')
+                        plt.legend()
 
                 plt.gca().set_ylim(bottom=max(inferred_model.loss['train']
                                               ['elbo'][0],
                                               inferred_model.loss['train']
                                               ['elbo'][-1] - 2000))
-                plt.legend()
                 plt.xlabel('Epoch')
                 plt.ylabel('ELBO')
                 plt.title('Progress of the training procedure')
@@ -1015,6 +1069,13 @@ def write_matrix_to_cellranger_h5(
             if loss is not None:
                 f.create_array(group, "training_elbo_per_epoch",
                                np.array(loss['train']['elbo']))
+                if 'test' in loss.keys():
+                    f.create_array(group, "test_elbo",
+                                   np.array(loss['test']['elbo']))
+                    f.create_array(group, "test_epoch",
+                                   np.array(loss['test']['epoch']))
+                    f.create_array(group, "fraction_data_used_for_testing",
+                                   1. - consts.TRAINING_FRACTION)
 
         logging.info(f"Succeeded in writing output to file {output_file}")
 

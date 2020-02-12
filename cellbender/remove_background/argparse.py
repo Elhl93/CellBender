@@ -91,11 +91,6 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                            dest="z_hidden_dims",
                            help="Dimension of hidden layers in the encoder "
                                 "for z.")
-    subparser.add_argument("--alpha-layers", nargs="+", type=int,
-                           default=[32, 8],
-                           dest="alpha_hidden_dims",
-                           help="Dimension of hidden layers in the encoder "
-                                "for alpha, the Dirichlet precision.")
     subparser.add_argument("--d-layers", nargs="+", type=int,
                            default=[5, 2, 2],
                            dest="d_hidden_dims",
@@ -106,6 +101,14 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                            dest="p_hidden_dims",
                            help="Dimension of hidden layers in the encoder "
                                 "for p.")
+    subparser.add_argument("--training-fraction",
+                           type=float, nargs=None,
+                           default=consts.TRAINING_FRACTION,
+                           dest="training_fraction",
+                           help="Training detail: the fraction of the "
+                                "data used for training.  The rest is never "
+                                "seen by the inference algorithm.  Speeds up "
+                                "learning.")
     subparser.add_argument("--empty-drop-training-fraction",
                            type=float, nargs=None,
                            default=consts.FRACTION_EMPTIES,
@@ -121,19 +124,25 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                                 "entirely.  In the output count matrix, "
                                 "the counts for these genes will be set "
                                 "to zero.")
-    subparser.add_argument("--lambda", nargs=None,
-                           type=float, default=1.,
+    subparser.add_argument("--lambda", nargs="+",
+                           type=float, default=[1.],
                            dest="lambda_multiplier",
                            help="Factor by which background estimate is "
                                 "multiplied prior to final background "
                                 "removal.  Must be positive.  More background "
                                 "removal is accompanied by more signal removal "
-                                "at high values of lambda.")
+                                "at high values of lambda.  You can specify "
+                                "multiple values, which will create multiple "
+                                "output files.")
     subparser.add_argument("--learning-rate", nargs=None,
-                           type=float, default=5e-4,
+                           type=float, default=1e-3,
                            dest="learning_rate",
                            help="Training detail: learning rate for "
                                 "inference (probably "
                                 "do not exceed 5e-4).")
+    subparser.add_argument("--jit",
+                           dest="use_jit", action="store_true",
+                           help="Including the flag --jit will use a JIT "
+                                "compiled version of the code for a speedup.")
 
     return subparsers

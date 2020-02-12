@@ -1,7 +1,6 @@
 """Definition of the model and the inference setup, with helper functions."""
 
 import numpy as np
-import scipy.sparse as sp
 
 import torch
 import torch.nn as nn
@@ -14,13 +13,15 @@ import pyro.poutine as poutine
 
 from cellbender.remove_background.vae import encoder as encoder_module
 import cellbender.remove_background.consts as consts
-from cellbender.remove_background.distributions.NegativeBinomialPoissonSumSparse \
-    import NegativeBinomialPoissonSumSparse as NBPSS
+from cellbender.remove_background.distributions.NegativeBinomialPoissonConv \
+    import NegativeBinomialPoissonConv as NBPC
 from cellbender.remove_background.distributions.NullDist import NullDist
+from cellbender.remove_background.distributions.PoissonImportanceMarginalizedGamma \
+    import PoissonImportanceMarginalizedGamma
+from cellbender.remove_background.exceptions import NanException
 
-from typing import Union, Tuple
+from typing import Union
 from numbers import Number
-import logging
 
 
 class RemoveBackgroundPyroModel(nn.Module):
@@ -45,8 +46,8 @@ class RemoveBackgroundPyroModel(nn.Module):
                  encoder: Union[nn.Module, encoder_module.CompositeEncoder],
                  decoder: nn.Module,
                  dataset_obj: 'SingleCellRNACountsDataset',
-                 rho_alpha_prior: float = 3,
-                 rho_beta_prior: float = 80,
+                 rho_alpha_prior: float = 1.5,
+                 rho_beta_prior: float = 20,
                  use_cuda: bool = False):
         super(RemoveBackgroundPyroModel, self).__init__()
 
@@ -154,10 +155,6 @@ class RemoveBackgroundPyroModel(nn.Module):
         self.rho_beta_prior = (rho_beta_prior
                                * torch.ones(torch.Size([])).to(self.device))
 
-        # TODO:
-        print(f'log_p(c=2000 | full) = {dist.LogNormal(self.d_cell_loc_prior, self.d_cell_scale_prior).log_prob(torch.Tensor([2000.])).item()}')
-        print(f'log_p(c=2000 | empty) = {dist.LogNormal(self.d_empty_loc_prior, self.d_empty_scale_prior).log_prob(torch.Tensor([2000.])).item()}')
-
     def calculate_lambda(self,
                          epsilon: torch.Tensor,
                          chi_ambient: torch.Tensor,
@@ -177,15 +174,11 @@ class RemoveBackgroundPyroModel(nn.Module):
                    + d_empty.unsqueeze(-1)) * chi_bar
 
         elif self.model_type == "full":
-            # lam = (d_empty.unsqueeze(-1) * chi_ambient.unsqueeze(0)
-            #        + (rho.unsqueeze(-1) * y.unsqueeze(-1)
-            #           * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
-            #           + d_empty.unsqueeze(-1)) * chi_bar)
-
-            lam = ((1. - rho.unsqueeze(-1)) * d_empty.unsqueeze(-1) * chi_ambient
-                   + rho.unsqueeze(-1)
-                   * (y.unsqueeze(-1) * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
-                      + d_empty.unsqueeze(-1)) * chi_bar)
+            lam = ((1. - rho.unsqueeze(-1))
+                   * epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1) * chi_ambient
+                   + rho.unsqueeze(-1) *
+                   (y.unsqueeze(-1) * d_cell.unsqueeze(-1)
+                    + d_empty.unsqueeze(-1)) * chi_bar)
         else:
             raise NotImplementedError(f"model_type was set to {self.model_type}, "
                                       f"which is not implemented.")
@@ -238,6 +231,13 @@ class RemoveBackgroundPyroModel(nn.Module):
         else:
             chi_ambient = None
 
+        # # TODO: added this for rho as hyperparameter
+        # if self.include_rho:
+        #     rho_alpha = pyro.param("rho_alpha",
+        #                            0.02 *
+        #                            torch.ones(torch.Size([])).to(self.device),
+        #                            constraint=constraints.unit_interval)
+
         # Happens in parallel for each data point (cell barcode) independently:
         with pyro.plate("data", x.size(0),
                         use_cuda=self.use_cuda, device=self.device):
@@ -257,42 +257,28 @@ class RemoveBackgroundPyroModel(nn.Module):
                                                 scale=self.alpha0_scale_prior)
                                  .expand_by([x.size(0)]))
 
-            # # Obtain alpha1 from the posterior.
-            # alpha1 = pyro.sample("alpha1_passback",
-            #                      NullDist(torch.zeros(1).to(self.device))
-            #                      .expand_by([x.size(0)]))
-
             # Sample d_cell based on priors.
             d_cell = pyro.sample("d_cell",
                                  dist.LogNormal(loc=self.d_cell_loc_prior,
                                                 scale=self.d_cell_scale_prior)
                                  .expand_by([x.size(0)]))
 
-            # print(f"mean d_cell > 1000 is {d_cell[x.sum(dim=-1) > 1000.].mean()}")
-            # print(f"mean d_cell < 1000 is {d_cell[x.sum(dim=-1) < 1000.].mean()}")
-            #
-            # print(f"mean alpha0 > 1000 is {alpha0[x.sum(dim=-1) > 1000.].mean()}")
-            # print(f"mean alpha0 < 1000 is {alpha0[x.sum(dim=-1) < 1000.].mean()}")
-
+            # TODO: changed rho from a latent to a hyperparameter
             # Sample swapping fraction rho.
             if self.include_rho:
                 rho = pyro.sample("rho", dist.Beta(self.rho_alpha_prior,
                                                    self.rho_beta_prior)
                                   .expand_by([x.size(0)]))
-                # rho = pyro.sample("rho", dist.Beta(self.rho_alpha_prior,
-                #                                    self.rho_beta_prior))  # TODO: check
+                # rho = torch.clamp(rho_alpha, min=1e-5, max=0.9)
             else:
                 rho = None
 
             # Sample epsilon based on priors.
-            # epsilon = torch.ones_like(alpha0).clone()
-            epsilon = pyro.sample("epsilon",
-                                  dist.Gamma(concentration=self.epsilon_prior,
-                                             rate=self.epsilon_prior)
-                                  .expand_by([x.size(0)]))
-
-            # print(f"mean epsilon > 1000 is {epsilon[x.sum(dim=-1) > 1000.].mean()}")
-            # print(f"mean epsilon < 1000 is {epsilon[x.sum(dim=-1) < 1000.].mean()}")
+            epsilon = torch.ones_like(alpha0).clone()  # TODO
+            # epsilon = pyro.sample("epsilon",
+            #                       dist.Gamma(concentration=self.epsilon_prior,
+            #                                  rate=self.epsilon_prior)
+            #                       .expand_by([x.size(0)]))
 
             # If modelling empty droplets:
             if self.include_empties:
@@ -328,30 +314,34 @@ class RemoveBackgroundPyroModel(nn.Module):
                                         rho=rho,
                                         chi_bar=self.avg_gene_expression)
 
-            # alpha = alpha0 * (alpha1 * chi + (1 - alpha1) * self.flat_alpha)
+            alpha = alpha0.unsqueeze(-1) * chi
 
-            # print(f'alpha range is [{alpha0.min():.0f}, '
-            #       f'{alpha0.mean():.0f}, {alpha0.max():.0f}]')
+            USE_NBPSS = True
 
-            # Sample gene expression from our Negative Binomial Poisson Sum
-            # distribution, and compare with observed data.
-            c = pyro.sample("obs",
-                            NBPSS(mu=mu_cell + 1e-10,
-                                  alpha=alpha0.unsqueeze(-1) * chi,
-                                  lam=lam + 1e-10,
-                                  max_poisson=100).to_event(1),
-                            obs=x.reshape(-1, self.n_genes))
+            if USE_NBPSS:
+
+                # Sample gene expression from our Negative Binomial Poisson
+                # Convolution distribution, and compare with observed data.
+                c = pyro.sample("obs",
+                                NBPC(mu=mu_cell + 1e-10,
+                                     alpha=alpha,
+                                     lam=lam + 1e-10,
+                                     max_poisson=100).to_event(1),
+                                obs=x.reshape(-1, self.n_genes))
+
+            else:
+
+                # Compare model with data using approximate marginalization over Poisson rate.
+                c = pyro.sample("obs",
+                                PoissonImportanceMarginalizedGamma(mu=mu_cell + 1e-10,
+                                                                   alpha=alpha + 1e-10,
+                                                                   lam=lam + 1e-10,
+                                                                   n_samples=10).to_event(1),
+                                obs=x.reshape(-1, self.n_genes))
 
             # Additionally use the surely empty droplets for regularization,
             # since we know these droplets by their UMI counts.
             if self.include_empties:
-
-                # with poutine.mask(mask=(y.detach() < 0.5)):
-                #
-                #     with poutine.scale(scale=0.1):
-                #         pyro.sample("empty_alpha0",
-                #                     dist.Normal(loc=alpha0, scale=0.5),
-                #                     obs=self.alpha0_loc_prior.expand(alpha0.size()))
 
                 counts = x.sum(dim=-1, keepdim=False)
                 surely_empty_mask = ((counts < self.empty_UMI_threshold)
@@ -385,14 +375,13 @@ class RemoveBackgroundPyroModel(nn.Module):
                                                              .to(self.device))
                                                     .expand_by([x.size(0)]))
 
-                    # print(f"mean p_logit_posterior > 1000 is {p_logit_posterior[x.sum(dim=-1) > 1000.].mean()}")
-                    # print(f"mean p_logit_posterior < 1000 is {p_logit_posterior[x.sum(dim=-1) < 1000.].mean()}")
-
-                    with poutine.scale(scale=1.):  # TODO: is this whole section doing anything?
+                    with poutine.scale(scale=1.):
 
                         pyro.sample("obs_empty_y",
                                     dist.Bernoulli(logits=p_logit_posterior),
                                     obs=torch.zeros_like(y))
+
+        return {'mu': mu_cell, 'lam': lam, 'alpha': alpha, 'counts': c}
 
     @config_enumerate(default='parallel')
     def guide(self, x: torch.Tensor):
@@ -402,6 +391,13 @@ class RemoveBackgroundPyroModel(nn.Module):
                 x: Mini-batch of data. Barcodes are rows, genes are columns.
 
         """
+
+        nan_check = False
+
+        if nan_check:
+            for param in pyro.get_param_store().keys():
+                if torch.isnan(pyro.param(param).sum()):
+                    raise NanException(param)
 
         # Register the encoder(s) with pyro.
         for name, module in self.encoder.items():
@@ -413,10 +409,7 @@ class RemoveBackgroundPyroModel(nn.Module):
                                   torch.ones(torch.Size([])).to(self.device),
                                   constraint=constraints.positive)
 
-        # # TODO: testing
         # # Initialize variational parameters for alpha0.
-        # alpha0_loc = pyro.param("alpha0_loc",
-        #                         torch.tensor(consts.ALPHA0_PRIOR_LOC).to(self.device))
         alpha0_scale = pyro.param("alpha0_scale",
                                   torch.tensor(consts.ALPHA0_PRIOR_SCALE).to(self.device),
                                   constraint=constraints.positive)
@@ -440,6 +433,7 @@ class RemoveBackgroundPyroModel(nn.Module):
                                      torch.ones(torch.Size([])).to(self.device),
                                      constraint=constraints.simplex)
 
+        # TODO: rho as a hyperparameter
         # Initialize variational parameters for rho.
         if self.include_rho:
             rho_alpha = pyro.param("rho_alpha",
@@ -455,11 +449,11 @@ class RemoveBackgroundPyroModel(nn.Module):
         with pyro.plate("data", x.size(0),
                         use_cuda=self.use_cuda, device=self.device):
 
-            # Sample swapping fraction rho.
-            if self.include_rho:
-                rho = pyro.sample("rho", dist.Beta(rho_alpha,
-                                                   rho_beta).expand_by([x.size(0)]))
-                # rho = pyro.sample("rho", dist.Beta(rho_alpha, rho_beta))  # TODO
+            # TODO: changed rho from a latent to a hyperparameter
+            # # Sample swapping fraction rho.
+            # if self.include_rho:
+            #     rho = pyro.sample("rho", dist.Beta(rho_alpha,
+            #                                        rho_beta).expand_by([x.size(0)]))
 
             # Encode the latent variables from the input gene expression counts.
             if self.include_empties:
@@ -483,10 +477,9 @@ class RemoveBackgroundPyroModel(nn.Module):
 
                 # Sample the Bernoulli y from encoded p(y).
                 y = pyro.sample("y", dist.Bernoulli(logits=enc['p_y']))
-                cell_mask = y.type(torch.BoolTensor).to(self.device)
 
                 # Mask out empty droplets.
-                with poutine.mask(mask=cell_mask):
+                with poutine.mask(mask=y.bool()):
 
                     # Sample latent code z for the barcodes containing cells.
                     pyro.sample("z",
@@ -499,25 +492,14 @@ class RemoveBackgroundPyroModel(nn.Module):
                                 dist.LogNormal(loc=enc['alpha0'],
                                                scale=alpha0_scale))
 
-                    # epsilon = torch.ones(x.shape[0])
-                    epsilon = pyro.sample("epsilon",
-                                          dist.Gamma(enc['epsilon'] * self.epsilon_prior,
-                                                     self.epsilon_prior))
-
-                    # # TODO: testing
-                    # # Sample alpha0 for the barcodes containing cells.
-                    # pyro.sample("alpha0",
-                    #             dist.LogNormal(loc=torch.tensor(2000.).to(self.device).log(),
-                    #                            scale=0.01))
+                    # epsilon = pyro.sample("epsilon",
+                    #                       dist.Gamma(enc['epsilon'] * self.epsilon_prior,
+                    #                                  self.epsilon_prior))  # TODO
 
                 # Gate d_cell_loc so empty droplets do not give big gradients.
                 prob = enc['p_y'].sigmoid()  # Logits to probability
                 d_cell_loc_gated = (prob * enc['d_loc'] + (1 - prob)
                                     * self.d_cell_loc_prior)
-
-                # print(f'prob.shape is {prob.shape}')
-                # print(f"enc['other']['d_loc'].shape is {enc['other']['d_loc'].shape}")
-                # print(f'd_cell_loc_gated.shape is {d_cell_loc_gated.shape}')
 
                 # Sample d based on the encoding.
                 pyro.sample("d_cell", dist.LogNormal(loc=d_cell_loc_gated,
@@ -589,206 +571,6 @@ class RemoveBackgroundPyroModel(nn.Module):
                 self.loss['params'][p + ':sum'].append(trace.nodes[p]['value'].sum().detach().cpu().numpy().item())
 
 
-def get_encodings(model: RemoveBackgroundPyroModel,
-                  dataset_obj: 'SingleCellRNACountsDataset',
-                  cells_only: bool = True) -> Tuple[np.ndarray,
-                                                    np.ndarray,
-                                                    np.ndarray]:
-    """Get inferred quantities from a trained model.
-
-    Run a dataset through the model's trained encoder and return the inferred
-    quantities.
-
-    Args:
-        model: A trained cellbender.model.VariationalInferenceModel, which will
-            be used to generate the encodings from data.
-        dataset_obj: The dataset to be encoded.
-        cells_only: If True, only returns the encodings of barcodes that are
-            determined to contain cells.
-
-    Returns:
-        z: Latent variable embedding of gene expression in a low-dimensional
-            space.
-        d: Latent variable scale factor for the number of UMI counts coming
-            from each real cell.  Not in log space, but actual size.  This is
-            not just the encoded d, but the mean of the LogNormal distribution,
-            which is exp(mean + sigma^2 / 2).
-        p: Latent variable denoting probability that each barcode contains a
-            real cell.
-
-    """
-
-    logging.info("Encoding data according to model.")
-
-    # Get the count matrix with genes trimmed.
-    if cells_only:
-        dataset = dataset_obj.get_count_matrix()
-    else:
-        dataset = dataset_obj.get_count_matrix_all_barcodes()
-
-    # Initialize numpy arrays as placeholders.
-    z = np.zeros((dataset.shape[0], model.z_dim))
-    d = np.zeros((dataset.shape[0]))
-    p = np.zeros((dataset.shape[0]))
-
-    # Get chi ambient, if it was part of the model.
-    chi_ambient = get_ambient_expression_from_pyro_param_store()
-    if chi_ambient is not None:
-        chi_ambient = torch.Tensor(chi_ambient).to(device=model.device)
-
-    # Send dataset through the learned encoder in chunks.
-    s = 200
-    for i in np.arange(0, dataset.shape[0], s):
-
-        # Put chunk of data into a torch.Tensor.
-        x = torch.Tensor(np.array(
-            dataset[i:min(dataset.shape[0], i + s), :].todense(),
-            dtype=int).squeeze()).to(device=model.device)
-
-        # Send data chunk through encoder.
-        enc = model.encoder.forward(x=x, chi_ambient=chi_ambient)
-
-        # Get d_cell_scale from fit model.
-        d_sig = to_ndarray(pyro.get_param_store().get_param('d_cell_scale'))
-
-        # Put the resulting encodings into the appropriate numpy arrays.
-        z[i:min(dataset.shape[0], i + s), :] = to_ndarray(enc['z']['loc'])
-        d[i:min(dataset.shape[0], i + s)] = (np.exp(to_ndarray(enc['d_loc']))
-                                             + d_sig.item()**2 / 2)
-        try:  # p is not always available: it depends which model was used.
-            p[i:min(dataset.shape[0], i + s)] = to_ndarray(enc['p_y'].sigmoid())
-        except KeyError:
-            p = None  # Simple model gets None for p.
-
-    return z, d, p
-
-
-def generate_maximum_a_posteriori_count_matrix(
-        z: np.ndarray,
-        d: np.ndarray,
-        p: Union[np.ndarray, None],
-        model: RemoveBackgroundPyroModel,
-        dataset_obj: 'SingleCellRNACountsDataset',
-        cells_only: bool = True,
-        chunk_size: int = 200) -> sp.csc.csc_matrix:
-    """Make a point estimate of ambient-background-subtracted UMI count matrix.
-
-    Sample counts by maximizing the model posterior based on learned latent
-    variables.  The output matrix is in sparse form.
-
-    Args:
-        z: Latent variable embedding of gene expression in a low-dimensional
-            space.
-        d: Latent variable scale factor for the number of UMI counts coming
-            from each real cell.
-        p: Latent variable denoting probability that each barcode contains a
-            real cell.
-        model: Model with latent variables already inferred.
-        dataset_obj: Input dataset.
-        cells_only: If True, only returns the encodings of barcodes that are
-            determined to contain cells.
-        chunk_size: Size of mini-batch of data to send through encoder at once.
-
-    Returns:
-        inferred_count_matrix: Matrix of the same dimensions as the input
-            matrix, but where the UMI counts have had ambient-background
-            subtracted.
-
-    Note:
-        This currently uses the MAP estimate of draws from a Poisson (or a
-        negative binomial with zero overdispersion).
-
-    """
-
-    # If simple model was used, then p = None.  Here set it to 1.
-    if p is None:
-        p = np.ones_like(d)
-
-    # Get the count matrix with genes trimmed.
-    if cells_only:
-        count_matrix = dataset_obj.get_count_matrix()
-    else:
-        count_matrix = dataset_obj.get_count_matrix_all_barcodes()
-
-    logging.info("Getting ambient-background-subtracted UMI count matrix.")
-
-    # Ensure there are no nans in p (there shouldn't be).
-    p_no_nans = p
-    p_no_nans[np.isnan(p)] = 0  # Just make sure there are no nans.
-
-    # Trim everything down to the barcodes we are interested in (just cells?).
-    if cells_only:
-        d = d[p_no_nans > consts.CELL_PROB_CUTOFF]
-        z = z[p_no_nans > consts.CELL_PROB_CUTOFF, :]
-        barcode_inds = \
-            dataset_obj.analyzed_barcode_inds[p_no_nans
-                                              > consts.CELL_PROB_CUTOFF]
-    else:
-        # Set cell size factors equal to zero where cell probability < 0.5.
-        d[p_no_nans < consts.CELL_PROB_CUTOFF] = 0.
-        z[p_no_nans < consts.CELL_PROB_CUTOFF, :] = 0.
-        barcode_inds = np.arange(0, count_matrix.shape[0])  # All barcodes
-
-    # Get the gene expression vectors by sending latent z through the decoder.
-    # Send dataset through the learned encoder in chunks.
-    barcodes = []
-    genes = []
-    counts = []
-    s = chunk_size
-    for i in np.arange(0, barcode_inds.size, s):
-
-        # TODO: for 117000 cells, this routine overflows (~15GB) memory
-
-        last_ind_this_chunk = min(count_matrix.shape[0], i+s)
-
-        # Decode gene expression for a chunk of barcodes.
-        decoded = model.decoder(torch.Tensor(
-            z[i:last_ind_this_chunk]).to(device=model.device))
-        chi = to_ndarray(decoded)
-
-        # Estimate counts for the chunk of barcodes as d * chi.
-        chunk_dense_counts = \
-            np.maximum(0,
-                       np.expand_dims(d[i:last_ind_this_chunk], axis=1) * chi)
-
-        # Turn the floating point count estimates into integers.
-        decimal_values, _ = np.modf(chunk_dense_counts)  # Stuff after decimal.
-        roundoff_counts = np.random.binomial(1, p=decimal_values)  # Bernoulli.
-        chunk_dense_counts = np.floor(chunk_dense_counts).astype(dtype=int)
-        chunk_dense_counts += roundoff_counts
-
-        # Find all the nonzero counts in this dense matrix chunk.
-        nonzero_barcode_inds_this_chunk, nonzero_genes_trimmed = \
-            np.nonzero(chunk_dense_counts)
-        nonzero_counts = \
-            chunk_dense_counts[nonzero_barcode_inds_this_chunk,
-                               nonzero_genes_trimmed].flatten(order='C')
-
-        # Get the original gene index from gene index in the trimmed dataset.
-        nonzero_genes = dataset_obj.analyzed_gene_inds[nonzero_genes_trimmed]
-
-        # Get the actual barcode values.
-        nonzero_barcode_inds = nonzero_barcode_inds_this_chunk + i
-        nonzero_barcodes = barcode_inds[nonzero_barcode_inds]
-
-        # Append these to their lists.
-        barcodes.extend(nonzero_barcodes.astype(dtype=np.uint32))
-        genes.extend(nonzero_genes.astype(dtype=np.uint16))
-        counts.extend(nonzero_counts.astype(dtype=np.uint32))
-
-    # Convert the lists to numpy arrays.
-    counts = np.array(counts, dtype=np.uint32)
-    barcodes = np.array(barcodes, dtype=np.uint32)
-    genes = np.array(genes, dtype=np.uint16)
-
-    # Put the counts into a sparse csc_matrix.
-    inferred_count_matrix = sp.csc_matrix((counts, (barcodes, genes)),
-                                          shape=dataset_obj.data['matrix']
-                                          .shape)
-
-    return inferred_count_matrix
-
-
 def get_ambient_expression() -> Union[np.ndarray, None]:
     """Get ambient RNA expression for 'empty' droplets.
 
@@ -804,23 +586,46 @@ def get_ambient_expression() -> Union[np.ndarray, None]:
 
     chi_ambient = None
 
-    try:
-        # Get fit hyperparameter for ambient gene expression from model.
-        chi_ambient = to_ndarray(pyro.param("chi_ambient")).squeeze()
-    except KeyError:
-        pass
+    if 'chi_ambient' in pyro.get_param_store().keys():
+        chi_ambient = to_ndarray(pyro.param('chi_ambient')).squeeze()
 
     return chi_ambient
+
+
+def get_rho() -> Union[np.ndarray, None]:
+    """Get ambient RNA expression for 'empty' droplets.
+
+    Return:
+        chi_ambient: The ambient gene expression profile, as a normalized
+            vector that sums to one.
+
+    Note:
+        Inference must have been performed on a model with a 'chi_ambient'
+        hyperparameter prior to making this call.
+
+    """
+
+    rho = None
+
+    if 'rho_alpha' in pyro.get_param_store().keys() \
+            and 'rho_beta' in pyro.get_param_store().keys():
+        rho = np.array([to_ndarray(pyro.param('rho_alpha')).item(),
+                        to_ndarray(pyro.param('rho_beta')).item()])
+
+    return rho
 
 
 def to_ndarray(x: Union[Number, np.ndarray, torch.Tensor]) -> np.ndarray:
     """Convert a numeric value or array to a numpy array on cpu."""
 
-    if type(x) is Number:
-        return np.array(x)
-
-    elif type(x) is np.ndarray:
+    if type(x) is np.ndarray:
         return x
 
     elif type(x) is torch.Tensor:
         return x.detach().cpu().numpy()
+
+    elif type(x) is Number:
+        return np.array(x)
+
+    else:
+        raise TypeError(f'to_ndarray() received input of type {type(x)}')

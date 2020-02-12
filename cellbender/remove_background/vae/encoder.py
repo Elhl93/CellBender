@@ -85,6 +85,7 @@ class EncodeZ(nn.Module):
                  input_transform: str = None):
         super(EncodeZ, self).__init__()
         self.input_dim = input_dim
+        self.output_dim = output_dim
         self.transform = input_transform
 
         # Set up the linear transformations used in fully-connected layers.
@@ -486,7 +487,7 @@ class EncodeNonZLatents(nn.Module):
         self.offset = None
 
         # Set up the initial scaling for values of x.
-        self.x_scaling = None
+        self.x_scaling = 1.  # None
 
     def forward(self,
                 x: torch.Tensor,
@@ -497,9 +498,6 @@ class EncodeNonZLatents(nn.Module):
         # the input gene expression and the estimate of the difference between
         # the ambient RNA profile and this barcode's gene expression to form
         # an augmented input.
-
-        if self.x_scaling is None:
-            self.x_scaling = 1. / x.std().item()  # Get values on a level field
 
         x = x.reshape(-1, self.n_genes)
 
@@ -512,18 +510,35 @@ class EncodeNonZLatents(nn.Module):
         # Apply transformation to data.
         x = transform_input(x, self.transform)
 
-        # Calculate cosine similarity between expression and ambient.
-        cosine_overlap = ((x * chi_ambient).sum(dim=-1, keepdim=True)
-                          / x.pow(2).sum(dim=-1, keepdim=True).pow(0.5)
-                          / chi_ambient.pow(2).sum(dim=-1, keepdim=True).pow(0.5))
+        # TODO: is this helpful?
+        # if self.x_scaling is None:
+        #     n_std_est = 10
+        #     num = int(self.n_genes * 0.4)
+        #     std_estimates = torch.zeros([n_std_est])
+        #     for i in range(n_std_est):
+        #         idx = torch.randperm(x.nelement())
+        #         std_estimates[i] = x.view(-1)[idx][:num].std().item()
+        #     robust_std = std_estimates.median().item()
+        #     self.x_scaling = 1. / robust_std / 100.  # Get values on a level field
+        #     print(f'std is {x.std().item()} and robust_std is {robust_std}')
+
+        # print(f'(x * self.x_scaling).mean() is {(x * self.x_scaling).mean()}')
+        # print(f'(x * self.x_scaling).std() is {(x * self.x_scaling).std()}')
+
+        # Calculate a similarity between expression and ambient.
+        overlap = (x * chi_ambient).sum(dim=-1, keepdim=True) * self.n_genes / 50.
+
+        # print(f'overlap.mean() is {overlap.mean()}')
 
         # Form a new input by concatenation.
         # Compute the hidden layers and the output.
-        hidden = self.nonlin(self.linears[0](torch.cat((log_sum,
-                                                        log_nnz,
-                                                        cosine_overlap,
-                                                        x * self.x_scaling),
-                                                       dim=-1)))
+        x_in = torch.cat((log_sum,
+                          log_nnz,
+                          overlap,
+                          x * self.x_scaling),
+                         dim=-1)
+
+        hidden = self.nonlin(self.linears[0](x_in))
         for i in range(1, len(self.linears)):  # Second hidden layer onward
             hidden = self.nonlin(self.linears[i](hidden))
 
@@ -548,14 +563,14 @@ class EncodeNonZLatents(nn.Module):
             # Heuristic for initialization of alpha.
             self.offset['alpha0'] = out[cells, 3].mean().item()
 
-            print(f"cell log_sum.mean() is {log_sum[cells].mean()}")
-            print(f"~cell log_sum.mean() is {log_sum[~cells].mean()}")
-            print(f"cell log_nnz.mean() is {log_nnz[cells].mean()}")
-            print(f"~cell log_nnz.mean() is {log_nnz[~cells].mean()}")
-            print(f"cell cosine_overlap.mean() is {cosine_overlap[cells].mean()}")
-            print(f"~cell cosine_overlap.mean() is {cosine_overlap[~cells].mean()}")
-            print(f"x.mean() is {x.mean()}")
-            print(f"x.std() is {x.std()}")
+            # print(f"cell log_sum.mean() is {log_sum[cells].mean()}")
+            # print(f"~cell log_sum.mean() is {log_sum[~cells].mean()}")
+            # print(f"cell log_nnz.mean() is {log_nnz[cells].mean()}")
+            # print(f"~cell log_nnz.mean() is {log_nnz[~cells].mean()}")
+            # print(f"cell overlap.mean() is {overlap[cells].mean()}")
+            # print(f"~cell overlap.mean() is {overlap[~cells].mean()}")
+            # print(f"x.mean() is {x.mean()}")
+            # print(f"x.std() is {x.std()}")
 
         return {'p_y': ((out[:, 0] - self.offset['logit_p'])
                         * self.P_OUTPUT_SCALE).squeeze(),
@@ -565,7 +580,7 @@ class EncodeNonZLatents(nn.Module):
                                        + self.log_count_crossover).squeeze(),
                 'epsilon': ((out[:, 2] - self.offset['epsilon']).squeeze()
                             * self.EPS_OUTPUT_SCALE + 1.),
-                'alpha0': self.softplus((out[:, 3] - self.offset['alpha0']) + 7.).squeeze()}
+                'alpha0': self.softplus((out[:, 3] - self.offset['alpha0'])).squeeze()}
 
 
 def transform_input(x: torch.Tensor, transform: str) -> Union[torch.Tensor,

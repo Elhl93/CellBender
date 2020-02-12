@@ -56,11 +56,13 @@ class CLI(AbstractCLI):
             "fraction_empties must be between 0 and 1, exclusive.  This is " \
             "the fraction of each minibatch that is composed of empty droplets."
 
-        assert args.learning_rate < 0.1, "learning_rate must be < 0.1"
-        assert args.learning_rate > 0, "learning_rate must be > 0"
+        assert args.learning_rate < 0.1, "learning-rate must be < 0.1"
+        assert args.learning_rate > 0, "learning-rate must be > 0"
 
         # Set training_fraction to consts.TRAINING_FRACTION (which is 1.).
-        args.training_fraction = consts.TRAINING_FRACTION
+        # args.training_fraction = consts.TRAINING_FRACTION
+        assert args.training_fraction > 0, "training-fraction must be > 0"
+        assert args.training_fraction <= 1., "training-fraction must be <= 1"
 
         # If cuda is requested, make sure it is available.
         if args.use_cuda:
@@ -77,8 +79,6 @@ class CLI(AbstractCLI):
         # Ensure all network layer dimensions are positive.
         for n in args.z_hidden_dims:
             assert n > 0, "--z-layers must be all positive integers."
-        for n in args.alpha_hidden_dims:
-            assert n > 0, "--alpha-layers must be all positive integers."
 
         # Ensure that z_hidden_dims are in encoder order.
         # (The same dimensions are used in reverse order for the decoder.)
@@ -88,7 +88,8 @@ class CLI(AbstractCLI):
         args.use_jit = False
 
         # Ensure lambda_multiplier is positive.
-        assert args.lambda_multiplier > 0.
+        for n in args.lambda_multiplier:
+            assert n > 0.
 
         self.args = args
 

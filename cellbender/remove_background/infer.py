@@ -2,13 +2,9 @@
 
 import pyro
 import pyro.distributions as dist
-from pyro.infer import SVI, Trace_ELBO
-from pyro.optim import ClippedAdam
 import torch
-from torch.distributions import constraints
 import numpy as np
 import scipy.sparse as sp
-from scipy.stats import mode as scipy_mode
 
 from typing import Tuple, List, Dict
 from abc import ABC, abstractmethod
@@ -38,52 +34,20 @@ class Posterior(ABC):
                  float_threshold: float = 0.5):
         self.dataset_obj = dataset_obj
         self.vi_model = vi_model
+        self.use_cuda = vi_model.use_cuda
         self.analyzed_gene_inds = dataset_obj.analyzed_gene_inds
         self.count_matrix_shape = dataset_obj.data['matrix'].shape
         self.barcode_inds = np.arange(0, self.count_matrix_shape[0])
         self.dtype = counts_dtype
         self.float_threshold = float_threshold
         self._mean = None
+        self._latents = None
         super(Posterior, self).__init__()
 
     @abstractmethod
     def _get_mean(self):
         """Obtain mean posterior counts and store in self._mean"""
         pass
-
-    @torch.no_grad()
-    def _get_encodings(self):
-        """Send dataset through a trained encoder."""
-
-        assert "chi_ambient" in pyro.get_param_store().keys(), \
-            "Attempting to encode the data before 'chi_ambient' has been " \
-            "inferred.  Run inference first."
-
-        data_loader = self.dataset_obj.get_dataloader(use_cuda=self.vi_model.use_cuda,
-                                                      analyzed_bcs_only=True,
-                                                      batch_size=500,
-                                                      shuffle=False)
-
-        self._encodings = {'z': [], 'd': [], 'p': [], 'alpha0': [], 'epsilon': []}
-
-        for data in data_loader:
-            # Get latent encodings. (z, d, p)
-            enc = self.vi_model.encoder.forward(x=data,
-                                                chi_ambient=pyro.param("chi_ambient"))
-
-            self._encodings['z'].append(enc['z']['loc'].detach().cpu().numpy())
-            self._encodings['d'].append(enc['d_loc']
-                                        .detach().exp().cpu().numpy())
-            self._encodings['p'].append(enc['p_y']
-                                        .detach().sigmoid().cpu().numpy())
-            self._encodings['alpha0'].append(enc['alpha0']
-                                             .detach().exp().cpu().numpy())
-            self._encodings['epsilon'].append(enc['epsilon']
-                                              .detach().cpu().numpy())
-
-        # Concatenate lists.
-        for key, value_list in self._encodings.items():
-            self._encodings[key] = np.concatenate(tuple(value_list), axis=0)
 
     @property
     def mean(self) -> sp.csc_matrix:
@@ -92,14 +56,104 @@ class Posterior(ABC):
         return self._mean
 
     @property
-    def encodings(self) -> Dict[str, np.ndarray]:
-        if self._encodings is None:
-            self._get_encodings()
-        return self._encodings
+    def latents(self) -> sp.csc_matrix:
+        if self._latents is None:
+            self._get_latents()
+        return self._latents
 
     @property
     def variance(self):
         raise NotImplemented("Posterior count variance not implemented.")
+
+    @torch.no_grad()
+    def _get_latents(self):
+        """Calculate the encoded latent variables."""
+
+        data_loader = self.dataset_obj.get_dataloader(use_cuda=self.use_cuda,
+                                                      analyzed_bcs_only=True,
+                                                      batch_size=500,
+                                                      shuffle=False)
+
+        z = np.zeros((len(data_loader), self.vi_model.encoder['z'].output_dim))
+        d = np.zeros(len(data_loader))
+        p = np.zeros(len(data_loader))
+        alpha0 = np.zeros(len(data_loader))
+        epsilon = np.zeros(len(data_loader))
+
+        for i, data in enumerate(data_loader):
+
+            enc = self.vi_model.encoder.forward(x=data,
+                                                chi_ambient=pyro.param('chi_ambient').detach())
+            ind = i * data_loader.batch_size
+            z[ind:(ind + data.shape[0]), :] = enc['z']['loc'].detach().cpu().numpy()
+            d[ind:(ind + data.shape[0])] = \
+                dist.LogNormal(loc=enc['d_loc'],
+                               scale=pyro.param('d_cell_scale')).mean.detach().cpu().numpy()
+            p[ind:(ind + data.shape[0])] = enc['p_y'].sigmoid().detach().cpu().numpy()
+            alpha0[ind:(ind + data.shape[0])] = \
+                dist.LogNormal(loc=enc['alpha0'],
+                               scale=pyro.param('alpha0_scale')).mean.detach().cpu().numpy()
+            # epsilon[ind:(ind + data.shape[0])] = enc['epsilon'].detach().cpu().numpy()
+            epsilon[ind:(ind + data.shape[0])] = torch.ones_like(enc['alpha0']).detach().cpu().numpy()  # TODO
+
+        self._latents = {'z': z, 'd': d, 'p': p, 'alpha0': alpha0, 'epsilon': epsilon}
+
+    @torch.no_grad()
+    def _param_map_estimates(self,
+                             data: torch.Tensor,
+                             chi_ambient: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Calculate MAP estimates of mu, the mean of the true count matrix, and
+        lambda, the rate parameter of the Poisson background counts.
+
+        Args:
+            data: Dense tensor minibatch of cell by gene count data.
+            chi_ambient: Point estimate of inferred ambient gene expression.
+
+        Returns:
+            mu_map: Dense tensor of Negative Binomial means for true counts.
+            lambda_map: Dense tensor of Poisson rate params for noise counts.
+            alpha_map: Dense tensor of Dirichlet concentration params that
+                inform the overdispersion of the Negative Binomial.
+
+        """
+
+        # Encode latents.
+        enc = self.vi_model.encoder.forward(x=data,
+                                            chi_ambient=chi_ambient)
+        z_map = enc['z']['loc']
+
+        chi_map = self.vi_model.decoder.forward(z_map)
+        alpha0_map = enc['alpha0']
+        alpha_map = chi_map * alpha0_map.unsqueeze(-1)
+
+        y = (enc['p_y'] > 0).float()
+        d_empty = dist.LogNormal(loc=pyro.param('d_empty_loc'),
+                                 scale=pyro.param('d_empty_scale')).mean
+        d_cell = dist.LogNormal(loc=enc['d_loc'],
+                                scale=pyro.param('d_cell_scale')).mean
+        # epsilon = enc['epsilon']
+        epsilon = torch.ones_like(alpha0_map)  # TODO
+
+        if self.vi_model.include_rho:
+            rho = pyro.param("rho_alpha") / pyro.param("rho_beta")
+        else:
+            rho = None
+
+        # Calculate MAP estimates of mu and lambda.
+        mu_map = self.vi_model.calculate_mu(epsilon=epsilon,
+                                            d_cell=d_cell,
+                                            chi=chi_map,
+                                            y=y,
+                                            rho=rho)
+        lambda_map = self.vi_model.calculate_lambda(epsilon=epsilon,
+                                                    chi_ambient=chi_ambient,
+                                                    d_empty=d_empty,
+                                                    y=y,
+                                                    d_cell=d_cell,
+                                                    rho=rho,
+                                                    chi_bar=self.vi_model.avg_gene_expression)
+
+        return {'mu': mu_map, 'lam': lambda_map, 'alpha': alpha_map}
 
     def dense_to_sparse(self,
                         chunk_dense_counts: np.ndarray) -> Tuple[List, List, List]:
@@ -203,7 +257,8 @@ class ImputedPosterior(Posterior):
         for data in data_loader:
 
             # Get return values from guide.
-            dense_counts_torch = self.guide(data, observe=False)
+            dense_counts_torch = self._param_map_estimates(data=data,
+                                                           chi_ambient=pyro.param("chi_ambient"))
             dense_counts = dense_counts_torch.detach().cpu().numpy()
             bcs_i_chunk, genes_i, counts_i = self.dense_to_sparse(dense_counts)
 
@@ -220,8 +275,8 @@ class ImputedPosterior(Posterior):
 
         # Convert the lists to numpy arrays.
         counts = np.array(np.concatenate(tuple(counts)), dtype=self.dtype)
-        barcodes = np.array(np.concatenate(tuple(barcodes)), dtype=self.dtype)
-        genes = np.array(np.concatenate(tuple(genes)), dtype=np.uint16)
+        barcodes = np.array(np.concatenate(tuple(barcodes)), dtype=np.uint32)
+        genes = np.array(np.concatenate(tuple(genes)), dtype=np.uint32)
 
         # Put the counts into a sparse csc_matrix.
         self._mean = sp.csc_matrix((counts, (barcodes, genes)),
@@ -275,7 +330,7 @@ class ProbPosterior(Posterior):
 
         data_loader = self.dataset_obj.get_dataloader(use_cuda=self.use_cuda,
                                                       analyzed_bcs_only=analyzed_bcs_only,
-                                                      batch_size=50,  # 100 overflowed once
+                                                      batch_size=20,
                                                       shuffle=False)
 
         chi_ambient = pyro.param("chi_ambient")
@@ -290,8 +345,8 @@ class ProbPosterior(Posterior):
             # Compute an estimate of the true counts.
             dense_counts = self._compute_true_counts(data,
                                                      chi_ambient,
-                                                     use_map=False,  # TODO: False
-                                                     n_samples=5)  # TODO: 13
+                                                     use_map=False,
+                                                     n_samples=9)  # must be odd number
             bcs_i_chunk, genes_i, counts_i = self.dense_to_sparse(dense_counts)
 
             # Translate chunk barcode inds to overall inds.
@@ -310,8 +365,8 @@ class ProbPosterior(Posterior):
 
         # Convert the lists to numpy arrays.
         counts = np.array(np.concatenate(tuple(counts)), dtype=self.dtype)
-        barcodes = np.array(np.concatenate(tuple(barcodes)), dtype=self.dtype)
-        genes = np.array(np.concatenate(tuple(genes)), dtype=np.uint16)
+        barcodes = np.array(np.concatenate(tuple(barcodes)), dtype=np.uint32)
+        genes = np.array(np.concatenate(tuple(genes)), dtype=np.uint32)  # uint16 is too small!
 
         # Put the counts into a sparse csc_matrix.
         self._mean = sp.csc_matrix((counts, (barcodes, genes)),
@@ -343,8 +398,10 @@ class ProbPosterior(Posterior):
         if use_map:
 
             # Calculate MAP estimates of mu and lambda.
-            mu_map, lambda_map, alpha_map = \
-                self._param_map_estimates(data, chi_ambient)
+            est = self._param_map_estimates(data, chi_ambient)
+            mu_map = est['mu']
+            lambda_map = est['lam']
+            alpha_map = est['alpha']
 
             # Compute the de-noised count matrix given the MAP estimates.
             dense_counts_torch = self._true_counts_from_params(data,
@@ -362,13 +419,14 @@ class ProbPosterior(Posterior):
 
             dense_counts_torch = torch.zeros((data.shape[0],
                                               data.shape[1],
-                                              n_samples), dtype=torch.float32)
+                                              n_samples),
+                                             dtype=torch.float32).to(data.device)
 
             for i in range(n_samples):
 
                 # Sample from mu and lambda.
                 mu_sample, lambda_sample, alpha_sample = \
-                    self._param_sample(data, chi_ambient)
+                    self._param_sample(data)
 
                 # Compute the de-noised count matrix given the estimates.
                 dense_counts_torch[..., i] = \
@@ -381,80 +439,17 @@ class ProbPosterior(Posterior):
             # dense_counts = dense_counts_torch.detach().cpu().numpy()
             # dense_counts = scipy_mode(dense_counts, axis=2)[0].squeeze()
 
-            # TODO: changed to median: check this
-            dense_counts = dense_counts_torch.median(dim=2, keepdim=False)[0].detach().cpu().numpy()
+            # TODO: changed to median: check this.  torch cuda does not implement mode
+            dense_counts = dense_counts_torch.median(dim=2, keepdim=False)[0]
+            dense_counts = dense_counts.detach().cpu().numpy().astype(np.int32)
 
         return dense_counts
 
     @torch.no_grad()
-    def _param_map_estimates(self,
-                             data: torch.Tensor,
-                             chi_ambient: torch.Tensor) -> Tuple[torch.Tensor,
-                                                                 torch.Tensor,
-                                                                 torch.Tensor]:
-        """Calculate MAP estimates of mu, the mean of the true count matrix, and
-        lambda, the rate parameter of the Poisson background counts.
-
-        Args:
-            data: Dense tensor minibatch of cell by gene count data.
-            chi_ambient: Point estimate of inferred ambient gene expression.
-
-        Returns:
-            mu_map: Dense tensor of Negative Binomial means for true counts.
-            lambda_map: Dense tensor of Poisson rate params for noise counts.
-            alpha_map: Dense tensor of Dirichlet concentration params that
-                inform the overdispersion of the Negative Binomial.
-
-        """
-
-        # Encode latents.
-        enc = self.vi_model.encoder.forward(x=data,
-                                            chi_ambient=chi_ambient)
-        z_map = enc['z']['loc']
-
-        chi_map = self.vi_model.decoder.forward(z_map)
-        alpha0_map = enc['alpha0']
-        alpha_map = chi_map * alpha0_map.unsqueeze(-1)
-
-        y = (enc['p_y'] > 0).float()
-        d_empty = dist.LogNormal(loc=pyro.param('d_empty_loc'),
-                                 scale=pyro.param('d_empty_scale')).mean
-        d_cell = dist.LogNormal(loc=enc['d_loc'],
-                                scale=pyro.param('d_cell_scale')).mean
-        epsilon = enc['epsilon']
-        # epsilon = torch.ones_like(y).clone()  # TODO
-
-        if self.vi_model.include_rho:
-            rho = pyro.param("rho_alpha") / pyro.param("rho_beta")
-        else:
-            rho = None
-
-        # Calculate MAP estimates of mu and lambda.
-        mu_map = self.vi_model.calculate_mu(epsilon=epsilon,
-                                            d_cell=d_cell,
-                                            chi=chi_map,
-                                            y=y,
-                                            rho=rho)
-        lambda_map = self.vi_model.calculate_lambda(epsilon=epsilon,
-                                                    chi_ambient=chi_ambient,
-                                                    d_empty=d_empty,
-                                                    y=y,
-                                                    d_cell=d_cell,
-                                                    rho=rho,
-                                                    chi_bar=self.vi_model.avg_gene_expression)
-        # mu_map = (epsilon.unsqueeze(-1) * y.unsqueeze(-1)
-        #           * d_cell.unsqueeze(-1) * chi_map) + 1e-10
-        # lambda_map = (epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1)
-        #               * chi_ambient) + 1e-10
-
-        return mu_map, lambda_map, alpha_map
-
-    @torch.no_grad()
     def _param_sample(self,
-                      data: torch.Tensor,
-                      chi_ambient: torch.Tensor) -> Tuple[torch.Tensor,
-                                                          torch.Tensor,
-                                                          torch.Tensor]:
+                      data: torch.Tensor) -> Tuple[torch.Tensor,
+                                                   torch.Tensor,
+                                                   torch.Tensor]:
         """Calculate a single sample estimate of mu, the mean of the true count
         matrix, and lambda, the rate parameter of the Poisson background counts.
 
@@ -472,48 +467,17 @@ class ProbPosterior(Posterior):
 
         """
 
-        # Encode latents.
-        enc = self.vi_model.encoder.forward(x=data,
-                                            chi_ambient=chi_ambient)
-        z = dist.Normal(loc=enc['z']['loc'], scale=enc['z']['scale']).sample()
+        # Use pyro poutine to trace the guide and sample parameter values.
+        guide_trace = pyro.poutine.trace(self.vi_model.guide).get_trace(x=data)
+        replayed_model = pyro.poutine.replay(self.vi_model.model, guide_trace)
 
-        chi_sample = self.vi_model.decoder.forward(z)
-        alpha0_sample = dist.LogNormal(loc=enc['alpha0'],
-                                       scale=pyro.param("alpha0_scale")).sample()
-        alpha_sample = chi_sample * alpha0_sample.unsqueeze(-1)
+        # Run the model using these sampled values.
+        replayed_model_output = replayed_model(x=data)
 
-        y = dist.Bernoulli(logits=enc['p_y']).sample()
-        d_empty = dist.LogNormal(loc=pyro.param('d_empty_loc'),
-                                 scale=pyro.param('d_empty_scale')).sample()
-        d_cell = dist.LogNormal(loc=enc['d_loc'],
-                                scale=pyro.param('d_cell_scale')).sample()
-        epsilon = dist.Gamma(enc['epsilon'] * self.vi_model.epsilon_prior,
-                             self.vi_model.epsilon_prior).sample()
-        # epsilon = torch.ones_like(y).clone()  # TODO
-
-        if self.vi_model.include_rho:
-            rho = dist.Beta(pyro.param("rho_alpha"),
-                            pyro.param("rho_beta")).expand_by([d_cell.size(0)]).sample()
-        else:
-            rho = None
-
-        # Calculate MAP estimates of mu and lambda.
-        mu_sample = self.vi_model.calculate_mu(epsilon=epsilon,
-                                               d_cell=d_cell,
-                                               chi=chi_sample,
-                                               y=y,
-                                               rho=rho)
-        lambda_sample = self.vi_model.calculate_lambda(epsilon=epsilon,
-                                                       chi_ambient=chi_ambient,
-                                                       d_empty=d_empty,
-                                                       y=y,
-                                                       d_cell=d_cell,
-                                                       rho=rho,
-                                                       chi_bar=self.vi_model.avg_gene_expression)
-        # mu_sample = (epsilon.unsqueeze(-1) * y.unsqueeze(-1)
-        #              * d_cell.unsqueeze(-1) * chi_sample) + 1e-10
-        # lambda_sample = (epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1)
-        #                  * chi_ambient) + 1e-10
+        # The model returns mu, alpha, and lambda.
+        mu_sample = replayed_model_output['mu']
+        lambda_sample = replayed_model_output['lam']
+        alpha_sample = replayed_model_output['alpha']
 
         return mu_sample, lambda_sample, alpha_sample
 
@@ -538,16 +502,19 @@ class ProbPosterior(Posterior):
 
         """
 
-        # Estimate the max number of noise counts for any entry in the batch.
-        max_noise_counts = int(5. * lambda_est.max())
-        max_noise_counts = min(max_noise_counts, 100)  # Memory limitations
+        # Estimate a reasonable low-end to begin the Poisson summation.
+        n = 100
+        poisson_values_low = (lambda_est.detach() - n / 2).int()
+
+        poisson_values_low = torch.clamp(torch.min(poisson_values_low,
+                                                   (data - n).int()), min=0).float()
 
         # Construct a big tensor of possible noise counts per cell per gene,
         # shape (batch_cells, n_genes, max_noise_counts)
-        noise_count_tensor = torch.arange(start=0,
-                                          end=max_noise_counts + 1) \
+        noise_count_tensor = torch.arange(start=0, end=n) \
                                   .expand([data.shape[0], data.shape[1], -1]) \
-                                  .float().to(device=self.vi_model.device) + 1e-10
+                                  .float().to(device=data.device)
+        noise_count_tensor = noise_count_tensor + poisson_values_low.unsqueeze(-1) + 1e-30
 
         # Compute probabilities of each number of noise counts.
         logits = (mu_est.log() - alpha_est.log()).unsqueeze(-1)
@@ -557,13 +524,13 @@ class ProbPosterior(Posterior):
                                                logits=logits)
                        .log_prob(data.unsqueeze(-1) - noise_count_tensor))
 
-        # TODO: this helps with the y=0, but posterior counts != 0 issue?  why?
-        prob_tensor[mu_est == 0] = 0.
-
         # Find the most probable number of noise counts per cell per gene.
         noise_count_map = torch.argmax(prob_tensor,
                                        dim=-1,
                                        keepdim=False).float()
+
+        # Handle the cases where y = 0 (no cell): all counts are noise.
+        noise_count_map[mu_est == 0] = n - 1 + poisson_values_low[mu_est == 0]  # max
 
         # Compute the number of true counts.
         dense_counts_torch = torch.clamp(data - noise_count_map, min=0.)

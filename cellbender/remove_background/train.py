@@ -10,21 +10,24 @@ from pyro.util import ignore_jit_warnings
 from cellbender.remove_background.model import RemoveBackgroundPyroModel
 from cellbender.remove_background.vae.decoder import Decoder
 from cellbender.remove_background.vae.encoder \
-    import EncodeZ, EncodeD, EncodeNonEmptyDropletLogitProb, \
-    EncodeAlpha0, CompositeEncoder, EncodeNonZLatents
+    import EncodeZ, CompositeEncoder, EncodeNonZLatents
 from cellbender.remove_background.data.dataset import SingleCellRNACountsDataset
 from cellbender.remove_background.data.dataprep import \
     prep_sparse_data_for_training as prep_data_for_training
 from cellbender.remove_background.data.dataprep import DataLoader
+from cellbender.remove_background.exceptions import NanException
 
 import numpy as np
+import torch
 
 from typing import Tuple, List
 import logging
+import time
 
 
 def train_epoch(svi: SVI,
-                train_loader: DataLoader) -> float:
+                train_loader: DataLoader,
+                epoch: int = 0) -> float:
     """Train a single epoch.
 
     Args:
@@ -46,6 +49,7 @@ def train_epoch(svi: SVI,
 
         # Perform gradient descent step and accumulate loss.
         epoch_loss += svi.step(x_cell_batch)
+        svi.optim.step(epoch=epoch)  # TODO: for LR scheduling
         normalizer_train += x_cell_batch.size(0)
 
     # Return epoch loss.
@@ -124,19 +128,26 @@ def run_training(model: RemoveBackgroundPyroModel,
         for epoch in range(epochs):
 
             # Train, and keep track of training loss.
-            total_epoch_loss_train = train_epoch(svi, train_loader)
+            if epoch == 0:
+                t = time.time()
+            total_epoch_loss_train = train_epoch(svi, train_loader, epoch=epoch)
             train_elbo.append(-total_epoch_loss_train)
             model.loss['train']['epoch'].append(epoch)
             model.loss['train']['elbo'].append(-total_epoch_loss_train)
 
             # TODO:
-            model.store_vars(x=train_loader.__next__(), params=['alpha0', 'd_cell',
-                                                                'd_empty', 'y',
-                                                                'p_passback', 'lam',
-                                                                'epsilon'])
+            # model.store_vars(x=train_loader.__next__(), params=['alpha0', 'd_cell',
+            #                                                     'd_empty', 'y',
+            #                                                     # 'p_passback',
+            #                                                     'lam',
+            #                                                     'epsilon'])
 
-            logging.info("[epoch %03d]  average training loss: %.4f"
-                         % (epoch, total_epoch_loss_train))
+            if epoch == 0:
+                logging.info("[epoch %03d]  average training loss: %.4f  (%.1f seconds per epoch)"
+                             % (epoch, total_epoch_loss_train, time.time() - t))
+            else:
+                logging.info("[epoch %03d]  average training loss: %.4f"
+                             % (epoch, total_epoch_loss_train))
 
             # If there is no test data (training_fraction == 1.), skip test.
             if len(test_loader) == 0:
@@ -157,6 +168,11 @@ def run_training(model: RemoveBackgroundPyroModel,
     except KeyboardInterrupt:
 
         logging.info("Inference procedure stopped by keyboard interrupt.")
+
+    # Exception allows program to produce output when terminated by a NaN.
+    except NanException as nan:
+
+        logging.info(f"Inference procedure terminated early due to a NaN value in {nan.param}")
 
     return train_elbo, test_elbo
 
@@ -202,36 +218,6 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
     encoder = CompositeEncoder({'z': encoder_z,
                                 'other': encoder_other})
 
-    # encoder_alpha0 = EncodeAlpha0(input_dim=count_matrix.shape[1],
-    #                               hidden_dims=args.alpha_hidden_dims)
-    #
-    # encoder_d = EncodeD(input_dim=count_matrix.shape[1],
-    #                     hidden_dims=args.d_hidden_dims,
-    #                     output_dim=1,
-    #                     log_count_crossover=
-    #                     dataset_obj.priors['log_counts_crossover'])
-    #
-    # if args.model == "simple":
-    #
-    #     # If using the simple model, there is no need for p.
-    #     encoder = CompositeEncoder({'z': encoder_z,
-    #                                 'alpha0': encoder_alpha0,
-    #                                 'd_loc': encoder_d})
-    #
-    # else:
-    #
-    #     # Models that include empty droplets.
-    #     encoder_p = EncodeNonEmptyDropletLogitProb(
-    #         input_dim=count_matrix.shape[1],
-    #         hidden_dims=args.p_hidden_dims,
-    #         output_dim=1,
-    #         input_transform='normalize',
-    #         log_count_crossover=dataset_obj.priors['log_counts_crossover'])
-    #     encoder = CompositeEncoder({'z': encoder_z,
-    #                                 'alpha0': encoder_alpha0,
-    #                                 'd_loc': encoder_d,
-    #                                 'p_y': encoder_p})
-
     # Decoder.
     decoder = Decoder(input_dim=args.z_dim,
                       hidden_dims=args.z_hidden_dims[::-1],
@@ -245,27 +231,6 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
                                       decoder=decoder,
                                       dataset_obj=dataset_obj,
                                       use_cuda=args.use_cuda)
-
-    # Set up the optimizer.
-    adam_args = {'lr': args.learning_rate}
-    optimizer = ClippedAdam(adam_args)
-
-    # Determine the loss function.
-    if args.use_jit:
-        loss_function = JitTraceEnum_ELBO(max_plate_nesting=1,
-                                          strict_enumeration_warning=False)
-    else:
-        loss_function = TraceEnum_ELBO(max_plate_nesting=1)
-
-    if args.model == "simple":
-        if args.use_jit:
-            loss_function = JitTrace_ELBO()
-        else:
-            loss_function = Trace_ELBO()
-
-    # Set up the inference process.
-    svi = SVI(model.model, model.guide, optimizer,
-              loss=loss_function)
 
     # Load the dataset into DataLoaders.
     frac = args.training_fraction  # Fraction of barcodes to use for training
@@ -282,8 +247,48 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
                                shuffle=True,
                                use_cuda=args.use_cuda)
 
+    # Set up the optimizer.
+    adam_args = {'lr': args.learning_rate}
+    optimizer = ClippedAdam(adam_args)
+
+    # Set up a learning rate scheduler.
+    optimizer_args = {'lr': 1e-3}
+    # scheduler_args = {'optimizer': torch.optim.Adam,
+    #                   'step_size': 1,
+    #                   'gamma': 1.5,
+    #                   'optim_args': optimizer_args}
+    # scheduler = pyro.optim.StepLR(scheduler_args)
+    scheduler_args = {'optimizer': torch.optim.Adam,
+                      'max_lr': 1e-1,
+                      'steps_per_epoch': len(train_loader),
+                      'epochs': args.epochs,
+                      'optim_args': optimizer_args}
+    scheduler = pyro.optim.OneCycleLR(scheduler_args)
+
+    # Determine the loss function.
+    if args.use_jit:
+
+        # Call guide() once as a warm-up.
+        model.guide(torch.zeros([10, dataset_obj.analyzed_gene_inds.size]).to(model.device))
+
+        if args.model == "simple":
+            loss_function = JitTrace_ELBO()
+        else:
+            loss_function = JitTraceEnum_ELBO(max_plate_nesting=1,
+                                              strict_enumeration_warning=False)
+    else:
+
+        if args.model == "simple":
+            loss_function = Trace_ELBO()
+        else:
+            loss_function = TraceEnum_ELBO(max_plate_nesting=1)
+
+    # Set up the inference process.
+    svi = SVI(model.model, model.guide, scheduler,
+              loss=loss_function)
+
     # Run training.
     run_training(model, svi, train_loader, test_loader,
-                 epochs=args.epochs, test_freq=10)
+                 epochs=args.epochs, test_freq=5)
 
     return model
