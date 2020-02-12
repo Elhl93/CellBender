@@ -450,10 +450,10 @@ class RemoveBackgroundPyroModel(nn.Module):
                         use_cuda=self.use_cuda, device=self.device):
 
             # TODO: changed rho from a latent to a hyperparameter
-            # # Sample swapping fraction rho.
-            # if self.include_rho:
-            #     rho = pyro.sample("rho", dist.Beta(rho_alpha,
-            #                                        rho_beta).expand_by([x.size(0)]))
+            # Sample swapping fraction rho.
+            if self.include_rho:
+                rho = pyro.sample("rho", dist.Beta(rho_alpha,
+                                                   rho_beta).expand_by([x.size(0)]))
 
             # Encode the latent variables from the input gene expression counts.
             if self.include_empties:

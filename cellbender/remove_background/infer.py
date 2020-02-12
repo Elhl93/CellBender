@@ -135,7 +135,8 @@ class Posterior(ABC):
         epsilon = torch.ones_like(alpha0_map)  # TODO
 
         if self.vi_model.include_rho:
-            rho = pyro.param("rho_alpha") / pyro.param("rho_beta")
+            rho = pyro.param("rho_alpha") / (pyro.param("rho_alpha")
+                                             + pyro.param("rho_beta"))
         else:
             rho = None
 
