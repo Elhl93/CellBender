@@ -1,13 +1,12 @@
 import pyro.distributions as dist
 
 import torch
-import torch.nn.functional as F
 from torch.distributions import constraints
 from torch.distributions.distribution import Distribution
-from torch.distributions.utils import \
-    broadcast_all, probs_to_logits, lazy_property, logits_to_probs
+from torch.distributions.utils import broadcast_all
 
 from numbers import Number
+from cellbender.remove_background.exceptions import NanException
 
 
 class TorchNegativeBinomialPoissonConvApprox(Distribution):
@@ -102,56 +101,35 @@ class TorchNegativeBinomialPoissonConvApprox(Distribution):
             self._validate_sample(value)
         mu, alpha, lam, value = broadcast_all(self.mu, self.alpha, self.lam, value)
 
-        # moment-matched negative binomial approximation
+        # Use a moment-matched negative binomial approximation.
         mean_hat = mu + lam
         alpha_hat = mean_hat.pow(2) * alpha * mu.pow(-2)
         nb_approx_log_prob = self._neg_binom_log_prob(mu=mean_hat,
                                                       alpha=alpha_hat,
                                                       value=value)
 
-        # # (brute-force) analytical solution for counts = 1
-        # one_indices = (value == 1)
-        # poisson_log_prob_zero = self._poisson_log_prob_zero(lam[one_indices])
-        # neg_binom_log_prob_zero = self._neg_binom_log_prob_zero(mu[one_indices],
-        #                                                         alpha[one_indices])
-        # poisson_log_prob_one = self._poisson_log_prob_one(lam[one_indices])
-        # neg_binom_log_prob_one = self._neg_binom_log_prob_one(mu[one_indices],
-        #                                                       alpha[one_indices])
-        # total_log_prob_one = torch.logsumexp(
-        #     torch.cat(((poisson_log_prob_zero + neg_binom_log_prob_one).unsqueeze(-1),
-        #                (poisson_log_prob_one + neg_binom_log_prob_zero).unsqueeze(-1)), dim=-1),
-        #     dim=-1, keepdim=False)
-        #
-        # # (brute-force) analytical solution for counts = 2
-        # two_indices = (value == 2)
-        # poisson_log_prob_zero = self._poisson_log_prob_zero(lam[two_indices])
-        # neg_binom_log_prob_zero = self._neg_binom_log_prob_zero(mu[two_indices],
-        #                                                         alpha[two_indices])
-        # poisson_log_prob_one = self._poisson_log_prob_one(lam[two_indices])
-        # neg_binom_log_prob_one = self._neg_binom_log_prob_one(mu[two_indices],
-        #                                                       alpha[two_indices])
-        # poisson_log_prob_two = self._poisson_log_prob_two(lam[two_indices])
-        # neg_binom_log_prob_two = self._neg_binom_log_prob_two(mu[two_indices],
-        #                                                       alpha[two_indices])
-        # total_log_prob_two = torch.logsumexp(
-        #     torch.cat(((poisson_log_prob_zero + neg_binom_log_prob_two).unsqueeze(-1),
-        #                (poisson_log_prob_one + neg_binom_log_prob_one).unsqueeze(-1),
-        #                (poisson_log_prob_two + neg_binom_log_prob_zero).unsqueeze(-1)), dim=-1),
-        #     dim=-1, keepdim=False)
-        #
-        # # replace brute-forced values
-        # log_prob = nb_approx_log_prob
-        # log_prob[one_indices] = total_log_prob_one
-        # log_prob[two_indices] = total_log_prob_two
-
-        # poisson for small mu
+        # Use a poisson for small mu, where the above approximation is bad.
         empty_indices = (mu < 1e-5)
         poisson_log_prob = self._poisson_log_prob(lam=lam[empty_indices],
                                                   value=value[empty_indices])
 
-        # replace
+        # Replace small mu log_prob values.
         log_prob = nb_approx_log_prob
-        log_prob[empty_indices] = poisson_log_prob
+        log_prob[empty_indices] = poisson_log_prob  # Deep copy, but it's faster
+
+        # NaN check!  Checking here prevents us from taking a bad gradient step.
+        if torch.isnan(log_prob.sum()):
+            param = []
+            if torch.isnan(mu.log().sum()):
+                param.append('mu')
+                print(f'mu problem values: {mu[torch.isnan(mu.log())]}')
+            if torch.isnan(alpha.log().sum()):
+                param.append('alpha')
+                print(f'alpha problem values: {alpha[torch.isnan(alpha.log())]}')
+            if torch.isnan(lam.log().sum()):
+                param.append('lam')
+                print(f'lam problem values: {lam[torch.isnan(lam.log())]}')
+            raise NanException(param=', '.join(param))
 
         return log_prob
 

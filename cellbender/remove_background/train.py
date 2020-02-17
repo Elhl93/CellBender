@@ -20,19 +20,21 @@ from cellbender.remove_background.exceptions import NanException
 import numpy as np
 import torch
 
-from typing import Tuple, List
+from typing import Tuple, List, Union
 import logging
 import time
 
 
 def train_epoch(svi: SVI,
                 train_loader: DataLoader,
-                epoch: int = 0) -> float:
+                epoch: Union[None, int] = None) -> float:
     """Train a single epoch.
 
     Args:
         svi: The pyro object used for stochastic variational inference.
         train_loader: Dataloader for training set.
+        epoch: Epoch used by the learning rate scheduler.  Use None for normal
+            schedule.  Can co-opt the schedule by setting a value (cool off).
 
     Returns:
         total_epoch_loss_train: The loss for this epoch of training, which is
@@ -49,7 +51,8 @@ def train_epoch(svi: SVI,
 
         # Perform gradient descent step and accumulate loss.
         epoch_loss += svi.step(x_cell_batch)
-        svi.optim.step(epoch=epoch)  # TODO: for LR scheduling
+        # print(f'LR = {next(iter(svi.optim.optim_objs.values())).get_lr()}')  # TODO
+        svi.optim.step(epoch=epoch)  # for LR scheduling
         normalizer_train += x_cell_batch.size(0)
 
     # Return epoch loss.
@@ -98,6 +101,7 @@ def run_training(model: RemoveBackgroundPyroModel,
                  train_loader: DataLoader,
                  test_loader: DataLoader,
                  epochs: int,
+                 epoch_start_cooldown: int,
                  test_freq: int = 10) -> Tuple[List[float],
                                                List[float]]:
     """Run an entire course of training, evaluating on a tests set periodically.
@@ -108,6 +112,7 @@ def run_training(model: RemoveBackgroundPyroModel,
             train_loader: Dataloader for training set.
             test_loader: Dataloader for tests set.
             epochs: Number of epochs to run training.
+            epoch_start_cooldown: Epoch at which cooldown starts.
             test_freq: Test set loss is calculated every test_freq epochs of
                 training.
 
@@ -127,10 +132,17 @@ def run_training(model: RemoveBackgroundPyroModel,
     try:
         for epoch in range(1, epochs + 1):
 
-            # Train, and keep track of training loss.
+            # Display duration of an epoch (use 2 to avoid initializations).
             if epoch == 2:
                 t = time.time()
-            total_epoch_loss_train = train_epoch(svi, train_loader, epoch=epoch)
+
+            # Train, and keep track of training loss.
+            if epoch >= epoch_start_cooldown:
+                # Co-opt the scheduler: make it think we're on epoch 0.
+                total_epoch_loss_train = train_epoch(svi, train_loader, epoch=0)
+            else:
+                total_epoch_loss_train = train_epoch(svi, train_loader)
+
             train_elbo.append(-total_epoch_loss_train)
             model.loss['train']['epoch'].append(epoch)
             model.loss['train']['elbo'].append(-total_epoch_loss_train)
@@ -172,7 +184,8 @@ def run_training(model: RemoveBackgroundPyroModel,
     # Exception allows program to produce output when terminated by a NaN.
     except NanException as nan:
 
-        logging.info(f"Inference procedure terminated early due to a NaN value in {nan.param}")
+        print(nan.message)
+        logging.info(f"Inference procedure terminated early due to a NaN value in: {nan.param}")
 
     return train_elbo, test_elbo
 
@@ -196,10 +209,8 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
     count_matrix = dataset_obj.get_count_matrix()
 
     # Configure pyro options (skip validations to improve speed).
-    # pyro.enable_validation(False)
-    # pyro.distributions.enable_validation(False)
-    pyro.enable_validation(True)  # TODO
-    pyro.distributions.enable_validation(True)
+    pyro.enable_validation(False)
+    pyro.distributions.enable_validation(False)
     pyro.set_rng_seed(0)
     pyro.clear_param_store()
 
@@ -255,17 +266,24 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
     # adam_args = {'lr': args.learning_rate}
     # optimizer = ClippedAdam(adam_args)
 
-    # Set up a learning rate scheduler.
-    optimizer_args = {'lr': args.learning_rate}
+    # # Learning rate sweep.
     # scheduler_args = {'optimizer': torch.optim.Adam,
     #                   'step_size': 1,
     #                   'gamma': 1.5,
     #                   'optim_args': optimizer_args}
     # scheduler = pyro.optim.StepLR(scheduler_args)
-    scheduler_args = {'optimizer': torch.optim.Adam,  # TODO: try clipping
-                      'max_lr': args.learning_rate * 50,
-                      'steps_per_epoch': len(train_loader),
-                      'epochs': args.epochs,
+
+    # Set up the optimizer.
+    optimizer = pyro.optim.clipped_adam.ClippedAdam
+    optimizer_args = {'lr': args.learning_rate, 'clip_norm': 10.}
+
+    # Set up a learning rate scheduler.
+    minibatches_per_epoch = int(np.ceil(len(train_loader) / train_loader.batch_size).item())
+    epoch_start_cooldown = max(50, args.epochs - 10)  # last 10 epochs (beyond 50) cool off
+    scheduler_args = {'optimizer': optimizer,
+                      'max_lr': args.learning_rate * 10,
+                      'steps_per_epoch': minibatches_per_epoch,
+                      'epochs': epoch_start_cooldown,
                       'optim_args': optimizer_args}
     scheduler = pyro.optim.OneCycleLR(scheduler_args)
 
@@ -293,7 +311,9 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
 
     # Run training.
     # model.guide(train_loader.__next__())  # TODO: just examine initialization
+    # with torch.autograd.set_detect_anomaly(True):  # TODO: debug only!!  doubles runtime!
     run_training(model, svi, train_loader, test_loader,
-                 epochs=args.epochs, test_freq=5)
+                 epochs=args.epochs, test_freq=5,
+                 epoch_start_cooldown=epoch_start_cooldown)
 
     return model

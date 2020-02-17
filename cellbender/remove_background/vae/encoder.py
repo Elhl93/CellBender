@@ -597,6 +597,9 @@ class EncodeNonZLatents(nn.Module):
 
         p_y_logit = ((out[:, 0] - self.offset['logit_p'])
                      * self.P_OUTPUT_SCALE).squeeze()
+        alpha0 = torch.clamp(self.softplus((out[:, 3] - self.offset['alpha0'])
+                                           + consts.ALPHA0_PRIOR_LOC),
+                             max=50.).squeeze()  # prevent overflow: exp(50) < max(float)
 
         # Feed z back in to the last layer of p_y_logit.  # TODO: try?
         # TODO: try clipping outputs to safe ranges (to prevent nans / overflow)
@@ -608,7 +611,7 @@ class EncodeNonZLatents(nn.Module):
                                        + self.log_count_crossover).squeeze(),
                 'epsilon': ((out[:, 2] - self.offset['epsilon']).squeeze()
                             * self.EPS_OUTPUT_SCALE + 1.),
-                'alpha0': self.softplus((out[:, 3] - self.offset['alpha0']) + 7.).squeeze()}
+                'alpha0': alpha0}
         # NOTE: if alpha0 initialization is too small, there is not enough difference
         # between NB and Poisson, and y reverts to zero.
 

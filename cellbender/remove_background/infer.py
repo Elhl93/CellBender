@@ -407,8 +407,8 @@ class ProbPosterior(Posterior):
             # Compute the de-noised count matrix given the MAP estimates.
             dense_counts_torch = self._true_counts_from_params(data,
                                                                mu_map,
-                                                               lambda_map * self.lambda_multiplier,
-                                                               alpha_map)
+                                                               lambda_map * self.lambda_multiplier + 1e-30,
+                                                               alpha_map + 1e-30)
 
             dense_counts = dense_counts_torch.detach().cpu().numpy()
 
@@ -433,8 +433,8 @@ class ProbPosterior(Posterior):
                 dense_counts_torch[..., i] = \
                     self._true_counts_from_params(data,
                                                   mu_sample,
-                                                  lambda_sample * self.lambda_multiplier,
-                                                  alpha_sample)
+                                                  lambda_sample * self.lambda_multiplier + 1e-30,
+                                                  alpha_sample + 1e-30)
 
             # Take the mode of the posterior true count distribution.
             # dense_counts = dense_counts_torch.detach().cpu().numpy()
@@ -504,20 +504,22 @@ class ProbPosterior(Posterior):
         """
 
         # Estimate a reasonable low-end to begin the Poisson summation.
-        n = 100
+        n = min(100., data.max().item())  # No need to exceed the max value
         poisson_values_low = (lambda_est.detach() - n / 2).int()
 
         poisson_values_low = torch.clamp(torch.min(poisson_values_low,
-                                                   (data - n).int()), min=0).float()
+                                                   (data - n + 1).int()), min=0).float()
 
         # Construct a big tensor of possible noise counts per cell per gene,
         # shape (batch_cells, n_genes, max_noise_counts)
         noise_count_tensor = torch.arange(start=0, end=n) \
                                   .expand([data.shape[0], data.shape[1], -1]) \
                                   .float().to(device=data.device)
-        noise_count_tensor = noise_count_tensor + poisson_values_low.unsqueeze(-1) + 1e-30
+        noise_count_tensor = noise_count_tensor + poisson_values_low.unsqueeze(-1)
 
         # Compute probabilities of each number of noise counts.
+        # NOTE: some values will be outside the support (negative values for NB).
+        # The resulting NaNs are ignored by torch.argmax().
         logits = (mu_est.log() - alpha_est.log()).unsqueeze(-1)
         prob_tensor = (dist.Poisson(lambda_est.unsqueeze(-1))
                        .log_prob(noise_count_tensor)
@@ -531,7 +533,7 @@ class ProbPosterior(Posterior):
                                        keepdim=False).float()
 
         # Handle the cases where y = 0 (no cell): all counts are noise.
-        noise_count_map[mu_est == 0] = n - 1 + poisson_values_low[mu_est == 0]  # max
+        noise_count_map[mu_est == 0] = data[mu_est == 0]
 
         # Compute the number of true counts.
         dense_counts_torch = torch.clamp(data - noise_count_map, min=0.)

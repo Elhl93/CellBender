@@ -76,7 +76,8 @@ class DataLoader:
         self.ptr = 0
 
     def __len__(self):
-        return int(self.ind_list.size * (1 + self.fraction_empties))  # ...ish
+        return int(self.ind_list.size *
+                   (1 + (self.fraction_empties / (1 - self.fraction_empties))))  # ...ish
 
     def __iter__(self):
         return self
