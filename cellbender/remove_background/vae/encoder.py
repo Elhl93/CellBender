@@ -487,7 +487,15 @@ class EncodeNonZLatents(nn.Module):
         self.offset = None
 
         # Set up the initial scaling for values of x.
-        self.x_scaling = 1.  # None
+        # self.x_scaling = 1.  # None  # TODO
+        self.x_scaling = None
+
+        # Set up initial values for overlap normalization.
+        self.overlap_mean = None
+        self.overlap_std = None
+
+    def _poisson_log_prob(self, lam, value):
+        return (lam.log() * value) - lam - (value + 1).lgamma()
 
     def forward(self,
                 x: torch.Tensor,
@@ -502,31 +510,46 @@ class EncodeNonZLatents(nn.Module):
         x = x.reshape(-1, self.n_genes)
 
         # Calculate log total UMI counts per barcode.
-        log_sum = x.sum(dim=-1, keepdim=True).log1p()
+        counts = x.sum(dim=-1, keepdim=True)
+        log_sum = counts.log1p()
 
         # Calculate the log of the number of nonzero genes.
         log_nnz = (x > 0).sum(dim=-1, keepdim=True).float().log1p()
+
+        # Calculate a similarity between expression and ambient.
+        # overlap = (x * chi_ambient).sum(dim=-1, keepdim=True) / (x * x).sum(dim=-1, keepdim=False)
+        overlap = self._poisson_log_prob(lam=counts * chi_ambient.detach().unsqueeze(0),
+                                         value=x).sum(dim=-1, keepdim=True)  # TODO: this overlap is good 2020/02/16
+        if self.overlap_mean is None:
+            self.overlap_mean = (overlap.max() + overlap.min()) / 2
+            self.overlap_std = overlap.max() - overlap.min()
+        overlap = (overlap - self.overlap_mean) / self.overlap_std * 5
+
+        # counts = counts.squeeze()
+        # print(f'overlap[counts > 1000].mean() is {overlap[counts > 1000].mean()}')
+        # print(f'overlap[counts < 1000].mean() is {overlap[counts < 1000].mean()}')
 
         # Apply transformation to data.
         x = transform_input(x, self.transform)
 
         # TODO: is this helpful?
-        # if self.x_scaling is None:
-        #     n_std_est = 10
-        #     num = int(self.n_genes * 0.4)
-        #     std_estimates = torch.zeros([n_std_est])
-        #     for i in range(n_std_est):
-        #         idx = torch.randperm(x.nelement())
-        #         std_estimates[i] = x.view(-1)[idx][:num].std().item()
-        #     robust_std = std_estimates.median().item()
-        #     self.x_scaling = 1. / robust_std / 100.  # Get values on a level field
-        #     print(f'std is {x.std().item()} and robust_std is {robust_std}')
+        if self.x_scaling is None:
+            n_std_est = 10
+            num = int(self.n_genes * 0.4)
+            std_estimates = torch.zeros([n_std_est])
+            for i in range(n_std_est):
+                idx = torch.randperm(x.nelement())
+                std_estimates[i] = x.view(-1)[idx][:num].std().item()
+            robust_std = std_estimates.median().item()
+            self.x_scaling = 1. / robust_std / 100.  # Get values on a level field
+            print(f'std is {x.std().item()} and robust_std is {robust_std}')
+            print(f'scaled x has mean {(x * self.x_scaling).mean()} and std {(x * self.x_scaling).std()}')
 
         # print(f'(x * self.x_scaling).mean() is {(x * self.x_scaling).mean()}')
         # print(f'(x * self.x_scaling).std() is {(x * self.x_scaling).std()}')
 
         # Calculate a similarity between expression and ambient.
-        overlap = (x * chi_ambient).sum(dim=-1, keepdim=True) * self.n_genes / 50.
+        # overlap = (x * chi_ambient).sum(dim=-1, keepdim=True) * self.n_genes / 50.
 
         # print(f'overlap.mean() is {overlap.mean()}')
 
@@ -552,7 +575,7 @@ class EncodeNonZLatents(nn.Module):
             cells = (log_sum > self.log_count_crossover).squeeze()
             cell_median = out[cells, 0].median().item()
             empty_median = out[~cells, 0].median().item()
-            self.offset['logit_p'] = empty_median + (cell_median - empty_median) * 9. / 10.  # 3. / 4.
+            self.offset['logit_p'] = empty_median + (cell_median - empty_median) * 9. / 10  # * 3. / 4
 
             # Heuristic for initialization of d.
             self.offset['d'] = out[cells, 1].median().item()
@@ -572,15 +595,22 @@ class EncodeNonZLatents(nn.Module):
             # print(f"x.mean() is {x.mean()}")
             # print(f"x.std() is {x.std()}")
 
-        return {'p_y': ((out[:, 0] - self.offset['logit_p'])
-                        * self.P_OUTPUT_SCALE).squeeze(),
+        p_y_logit = ((out[:, 0] - self.offset['logit_p'])
+                     * self.P_OUTPUT_SCALE).squeeze()
+
+        # Feed z back in to the last layer of p_y_logit.  # TODO: try?
+        # TODO: try clipping outputs to safe ranges (to prevent nans / overflow)
+
+        return {'p_y': p_y_logit,
                 'd_loc': self.softplus(out[:, 1] - self.offset['d']
                                        + self.softplus(log_sum.squeeze()
                                                        - self.log_count_crossover)
                                        + self.log_count_crossover).squeeze(),
                 'epsilon': ((out[:, 2] - self.offset['epsilon']).squeeze()
                             * self.EPS_OUTPUT_SCALE + 1.),
-                'alpha0': self.softplus((out[:, 3] - self.offset['alpha0'])).squeeze()}
+                'alpha0': self.softplus((out[:, 3] - self.offset['alpha0']) + 7.).squeeze()}
+        # NOTE: if alpha0 initialization is too small, there is not enough difference
+        # between NB and Poisson, and y reverts to zero.
 
 
 def transform_input(x: torch.Tensor, transform: str) -> Union[torch.Tensor,

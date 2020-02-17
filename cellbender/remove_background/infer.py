@@ -344,8 +344,8 @@ class ProbPosterior(Posterior):
         for data in data_loader:
 
             # Compute an estimate of the true counts.
-            dense_counts = self._compute_true_counts(data,
-                                                     chi_ambient,
+            dense_counts = self._compute_true_counts(data=data,
+                                                     chi_ambient=chi_ambient,
                                                      use_map=False,
                                                      n_samples=9)  # must be odd number
             bcs_i_chunk, genes_i, counts_i = self.dense_to_sparse(dense_counts)

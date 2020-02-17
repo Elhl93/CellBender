@@ -15,6 +15,8 @@ from cellbender.remove_background.vae import encoder as encoder_module
 import cellbender.remove_background.consts as consts
 from cellbender.remove_background.distributions.NegativeBinomialPoissonConv \
     import NegativeBinomialPoissonConv as NBPC
+from cellbender.remove_background.distributions.NegativeBinomialPoissonConvApprox \
+    import NegativeBinomialPoissonConvApprox as NBPCapprox
 from cellbender.remove_background.distributions.NullDist import NullDist
 from cellbender.remove_background.distributions.PoissonImportanceMarginalizedGamma \
     import PoissonImportanceMarginalizedGamma
@@ -316,41 +318,71 @@ class RemoveBackgroundPyroModel(nn.Module):
 
             alpha = alpha0.unsqueeze(-1) * chi
 
-            USE_NBPSS = True
+            USE_NBPC = False
 
-            if USE_NBPSS:
+            if USE_NBPC:
 
                 # Sample gene expression from our Negative Binomial Poisson
                 # Convolution distribution, and compare with observed data.
-                c = pyro.sample("obs",
-                                NBPC(mu=mu_cell + 1e-10,
-                                     alpha=alpha,
-                                     lam=lam + 1e-10,
-                                     max_poisson=100).to_event(1),
+                c = pyro.sample("obs", NBPC(mu=mu_cell + 1e-10,
+                                            alpha=alpha,
+                                            lam=lam + 1e-10,
+                                            max_poisson=50).to_event(1),
                                 obs=x.reshape(-1, self.n_genes))
 
             else:
 
-                # Compare model with data using approximate marginalization over Poisson rate.
-                c = pyro.sample("obs",
-                                PoissonImportanceMarginalizedGamma(mu=mu_cell + 1e-10,
-                                                                   alpha=alpha + 1e-10,
-                                                                   lam=lam + 1e-10,
-                                                                   n_samples=10).to_event(1),
+                # Use a negative binomial approximation as the observation model.
+                c = pyro.sample("obs", NBPCapprox(mu=mu_cell + 1e-10,
+                                                  alpha=alpha,
+                                                  lam=lam + 1e-10).to_event(1),
                                 obs=x.reshape(-1, self.n_genes))
+
+                # # Compare model with data using approximate marginalization over Poisson rate.
+                # c = pyro.sample("obs",
+                #                 PoissonImportanceMarginalizedGamma(mu=mu_cell + 1e-10,
+                #                                                    alpha=alpha + 1e-10,
+                #                                                    lam=lam + 1e-10,
+                #                                                    n_samples=10).to_event(1),
+                #                 obs=x.reshape(-1, self.n_genes))
+
+            # Additionally use some high-count droplets for cell prob regularization.
+            counts = x.sum(dim=-1, keepdim=False)
+            # surely_cell_mask = (torch.where(counts >= self.d_cell_loc_prior.exp(),
+            #                                 torch.ones_like(counts),
+            #                                 torch.zeros_like(counts))
+            #                     .bool().to(self.device))
+            # print(f'sure cells = {surely_cell_mask.sum()}')
+
+            p_logit_posterior = pyro.sample("p_passback",
+                                            NullDist(torch.zeros(1)
+                                                     .to(self.device))
+                                            .expand_by([x.size(0)]))
+
+            # with poutine.mask(mask=surely_cell_mask):
+            #
+            #     with poutine.scale(scale=0.1):
+            #
+            #         pyro.sample("obs_cell_y",
+            #                     dist.Normal(loc=p_logit_posterior,
+            #                                 scale=1.),
+            #                     obs=torch.ones_like(y) * 5.)
+
+            # Regularize based on wanting a balanced p_y_logit.
+            pyro.sample("p_logit_reg", dist.Normal(loc=self.p_logit_prior,
+                                                   scale=2. * torch.ones([1]).to(self.device)))
 
             # Additionally use the surely empty droplets for regularization,
             # since we know these droplets by their UMI counts.
             if self.include_empties:
 
-                counts = x.sum(dim=-1, keepdim=False)
                 surely_empty_mask = ((counts < self.empty_UMI_threshold)
-                                     .type(torch.BoolTensor).to(self.device))
+                                     .bool().to(self.device))
 
                 with poutine.mask(mask=surely_empty_mask):
 
                     # TODO: try this
-                    with poutine.scale(scale=0.1):
+                    with poutine.scale(scale=0.01):
 
                         if self.include_rho:
                             r = rho.detach()
@@ -370,16 +402,23 @@ class RemoveBackgroundPyroModel(nn.Module):
                                     obs=x.reshape(-1, self.n_genes))
 
                     # Semi-supervision of cell probabilities.
-                    p_logit_posterior = pyro.sample("p_passback",
-                                                    NullDist(torch.zeros(1)
-                                                             .to(self.device))
-                                                    .expand_by([x.size(0)]))
 
-                    with poutine.scale(scale=1.):
+                    # print(f'{(p_logit_posterior > 0).sum()} p_logit_posterior > 0, {(p_logit_posterior < 0).sum()} p_logit_posterior < 0')
+                    # print(f'p_logit_posterior[> 0].median() is {p_logit_posterior[p_logit_posterior > 0].median()}')
+                    # print(f'p_logit_posterior[< 0].median() is {p_logit_posterior[p_logit_posterior < 0].median()}')
+                    # print(f'p_logit_posterior[mask].median() is {p_logit_posterior[surely_empty_mask].median()}')
 
+                    with poutine.scale(scale=1.0):
+
+                        # pyro.sample("obs_empty_y",
+                        #             dist.Bernoulli(logits=p_logit_posterior),
+                        #             obs=torch.zeros_like(y))
                         pyro.sample("obs_empty_y",
-                                    dist.Bernoulli(logits=p_logit_posterior),
-                                    obs=torch.zeros_like(y))
+                                    dist.Normal(loc=p_logit_posterior,
+                                                scale=1.),
+                                    obs=torch.ones_like(y) * -5.)  # TODO: try -10
+
+
 
         return {'mu': mu_cell, 'lam': lam, 'alpha': alpha, 'counts': c}
 
@@ -471,6 +510,9 @@ class RemoveBackgroundPyroModel(nn.Module):
 
             # Code specific to models with empty droplets.
             if self.include_empties:
+
+                # Regularize based on wanting a balanced p_y_logit.
+                pyro.sample("p_logit_reg", dist.Normal(loc=enc['p_y'], scale=2.))
 
                 # Pass back the inferred p_y to the model.
                 pyro.sample("p_passback", NullDist(enc['p_y'].detach()))  # TODO

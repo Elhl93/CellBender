@@ -125,10 +125,10 @@ def run_training(model: RemoveBackgroundPyroModel,
 
     # Run training loop.  Use try to allow for keyboard interrupt.
     try:
-        for epoch in range(epochs):
+        for epoch in range(1, epochs + 1):
 
             # Train, and keep track of training loss.
-            if epoch == 0:
+            if epoch == 2:
                 t = time.time()
             total_epoch_loss_train = train_epoch(svi, train_loader, epoch=epoch)
             train_elbo.append(-total_epoch_loss_train)
@@ -136,13 +136,13 @@ def run_training(model: RemoveBackgroundPyroModel,
             model.loss['train']['elbo'].append(-total_epoch_loss_train)
 
             # TODO:
-            # model.store_vars(x=train_loader.__next__(), params=['alpha0', 'd_cell',
-            #                                                     'd_empty', 'y',
-            #                                                     # 'p_passback',
-            #                                                     'lam',
-            #                                                     'epsilon'])
+            model.store_vars(x=train_loader.__next__(), params=['alpha0', 'd_cell',
+                                                                'd_empty', 'y',
+                                                                'p_passback',
+                                                                'lam'])#,
+                                                                # 'epsilon'])
 
-            if epoch == 0:
+            if epoch == 2:
                 logging.info("[epoch %03d]  average training loss: %.4f  (%.1f seconds per epoch)"
                              % (epoch, total_epoch_loss_train, time.time() - t))
             else:
@@ -196,8 +196,10 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
     count_matrix = dataset_obj.get_count_matrix()
 
     # Configure pyro options (skip validations to improve speed).
-    pyro.enable_validation(False)
-    pyro.distributions.enable_validation(False)
+    # pyro.enable_validation(False)
+    # pyro.distributions.enable_validation(False)
+    pyro.enable_validation(True)  # TODO
+    pyro.distributions.enable_validation(True)
     pyro.set_rng_seed(0)
     pyro.clear_param_store()
 
@@ -210,8 +212,8 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
                         input_transform='normalize')
 
     encoder_other = EncodeNonZLatents(n_genes=count_matrix.shape[1],
-                                      hidden_dims=[50, 10],  # TODO
-                                      # hidden_dims=[100, 50],  # TODO
+                                      # hidden_dims=[50, 10],  # TODO
+                                      hidden_dims=[100, 50],  # TODO
                                       log_count_crossover=dataset_obj.priors['log_counts_crossover'],
                                       input_transform='normalize')
 
@@ -234,8 +236,10 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
 
     # Load the dataset into DataLoaders.
     frac = args.training_fraction  # Fraction of barcodes to use for training
-    batch_size = int(min(500,
-                         frac * dataset_obj.analyzed_barcode_inds.size / 2))
+    # batch_size = int(min(500,
+    #                      frac * dataset_obj.analyzed_barcode_inds.size / 2))
+    batch_size = int(min(300,
+                         frac * dataset_obj.analyzed_barcode_inds.size / 2))  # TODO: playing with batch sizes
     train_loader, test_loader = \
         prep_data_for_training(dataset=count_matrix,
                                empty_drop_dataset=
@@ -247,19 +251,19 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
                                shuffle=True,
                                use_cuda=args.use_cuda)
 
-    # Set up the optimizer.
-    adam_args = {'lr': args.learning_rate}
-    optimizer = ClippedAdam(adam_args)
+    # # Set up the optimizer.
+    # adam_args = {'lr': args.learning_rate}
+    # optimizer = ClippedAdam(adam_args)
 
     # Set up a learning rate scheduler.
-    optimizer_args = {'lr': 1e-3}
+    optimizer_args = {'lr': args.learning_rate}
     # scheduler_args = {'optimizer': torch.optim.Adam,
     #                   'step_size': 1,
     #                   'gamma': 1.5,
     #                   'optim_args': optimizer_args}
     # scheduler = pyro.optim.StepLR(scheduler_args)
-    scheduler_args = {'optimizer': torch.optim.Adam,
-                      'max_lr': 1e-1,
+    scheduler_args = {'optimizer': torch.optim.Adam,  # TODO: try clipping
+                      'max_lr': args.learning_rate * 50,
                       'steps_per_epoch': len(train_loader),
                       'epochs': args.epochs,
                       'optim_args': optimizer_args}
@@ -288,6 +292,7 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
               loss=loss_function)
 
     # Run training.
+    # model.guide(train_loader.__next__())  # TODO: just examine initialization
     run_training(model, svi, train_loader, test_loader,
                  epochs=args.epochs, test_freq=5)
 

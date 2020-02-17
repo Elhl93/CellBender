@@ -428,7 +428,7 @@ def sample_from_dirichlet_model(num: int,
     assert v_sigma > 0, f'v_sigma must be > 0, but was {v_sigma}'
     assert np.all(alpha > 0), 'all alphas must be > 0.'
     assert np.all(chi_ambient > 0), 'all chi_ambient must be > 0.'
-    assert chi_ambient.sum() == 1., f'chi_ambient must sum to 1, but it sums ' \
+    assert np.abs(1. - chi_ambient.sum()) < 1e-10, f'chi_ambient must sum to 1, but it sums ' \
         f'to {chi_ambient.sum()}'
     assert len(chi_ambient.shape) == 1, 'chi_ambient should be 1-dimensional.'
     assert alpha.shape[0] == chi_ambient.size, 'alpha and chi_ambient must ' \
