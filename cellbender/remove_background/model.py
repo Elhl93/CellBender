@@ -325,7 +325,7 @@ class RemoveBackgroundPyroModel(nn.Module):
                 # Sample gene expression from our Negative Binomial Poisson
                 # Convolution distribution, and compare with observed data.
                 c = pyro.sample("obs", NBPC(mu=mu_cell + 1e-10,
-                                            alpha=alpha,
+                                            alpha=alpha + 1e-10,
                                             lam=lam + 1e-10,
                                             max_poisson=50).to_event(1),
                                 obs=x.reshape(-1, self.n_genes))
@@ -334,7 +334,7 @@ class RemoveBackgroundPyroModel(nn.Module):
 
                 # Use a negative binomial approximation as the observation model.
                 c = pyro.sample("obs", NBPCapprox(mu=mu_cell + 1e-10,
-                                                  alpha=alpha,
+                                                  alpha=alpha + 1e-10,  # Avoid NaNs
                                                   lam=lam + 1e-10).to_event(1),
                                 obs=x.reshape(-1, self.n_genes))
 
@@ -478,11 +478,11 @@ class RemoveBackgroundPyroModel(nn.Module):
             rho_alpha = pyro.param("rho_alpha",
                                    self.rho_alpha_prior *
                                    torch.ones(torch.Size([])).to(self.device),
-                                   constraint=constraints.positive)
+                                   constraint=constraints.interval(1., 1000.))  # Prevent NaNs
             rho_beta = pyro.param("rho_beta",
                                   self.rho_beta_prior *
                                   torch.ones(torch.Size([])).to(self.device),
-                                  constraint=constraints.positive)
+                                  constraint=constraints.interval(1., 1000.))
 
         # Happens in parallel for each data point (cell barcode) independently:
         with pyro.plate("data", x.size(0),
@@ -491,6 +491,7 @@ class RemoveBackgroundPyroModel(nn.Module):
             # TODO: changed rho from a latent to a hyperparameter
             # Sample swapping fraction rho.
             if self.include_rho:
+                # print(f'rho_alpha ise {rho_alpha}; rho_beta is {rho_beta}')
                 rho = pyro.sample("rho", dist.Beta(rho_alpha,
                                                    rho_beta).expand_by([x.size(0)]))
 
