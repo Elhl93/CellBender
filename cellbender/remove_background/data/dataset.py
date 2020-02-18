@@ -67,6 +67,7 @@ class SingleCellRNACountsDataset:
                  fraction_empties: float = 0.5,
                  model_name: str = None,
                  gene_blacklist: List[int] = [],
+                 exclude_antibodies: bool = False,
                  low_count_threshold: int = 30,
                  lambda_multiplier: List[float] = [1.]):
         assert input_file is not None, "Attempting to load data, but no " \
@@ -76,6 +77,7 @@ class SingleCellRNACountsDataset:
         self.analyzed_gene_inds = np.array([])
         self.empty_barcode_inds = np.array([])  # Barcodes randomized each epoch
         self.data = None
+        self.exclude_antibodies = exclude_antibodies
         self.model_name = model_name
         self.fraction_empties = fraction_empties
         self.is_trimmed = False
@@ -181,8 +183,12 @@ class SingleCellRNACountsDataset:
         # Choose which genes to use based on their having nonzero counts.
         # (All barcodes must be included so that inference can generalize.)
         gene_counts_per_barcode = np.array(matrix.sum(axis=0)).squeeze()
-        self.analyzed_gene_inds = np.where(gene_counts_per_barcode
-                                           > 0)[0].astype(dtype=int)
+        if self.exclude_antibodies:
+            antibody_logic = (self.data['feature_types'] == 'Antibody Capture')
+            # Exclude these by setting their counts to zero
+            gene_counts_per_barcode[antibody_logic] = 0
+        nonzero_gene_counts = (gene_counts_per_barcode > 0)
+        self.analyzed_gene_inds = np.where(nonzero_gene_counts)[0].astype(dtype=int)
 
         if self.analyzed_gene_inds.size == 0:
             logging.warning("During data loading, found no genes with > 0 "
@@ -541,6 +547,8 @@ class SingleCellRNACountsDataset:
             write_succeeded = write_matrix_to_cellranger_h5(
                 output_file=output_file,
                 gene_names=self.data['gene_names'],
+                gene_ids=self.data['gene_ids'],
+                feature_types=self.data['feature_type'],
                 barcodes=self.data['barcodes'],
                 inferred_count_matrix=inferred_count_matrix,
                 cell_barcode_inds=cell_barcode_inds,
@@ -565,6 +573,8 @@ class SingleCellRNACountsDataset:
                 write_matrix_to_cellranger_h5(
                     output_file=filtered_output_file,
                     gene_names=self.data['gene_names'],
+                    gene_ids=self.data['gene_ids'],
+                    feature_types=self.data['feature_type'],
                     barcodes=cell_barcodes,
                     inferred_count_matrix=inferred_count_matrix[cell_barcode_inds, :],
                     cell_barcode_inds=None,
@@ -596,6 +606,8 @@ class SingleCellRNACountsDataset:
                 write_succeeded = write_matrix_to_cellranger_h5(
                     output_file=temp_output_filename,
                     gene_names=self.data['gene_names'],
+                    gene_ids=self.data['gene_ids'],
+                    feature_types=self.data['feature_type'],
                     barcodes=self.data['barcodes'],
                     inferred_count_matrix=inferred_count_matrix,
                     cell_barcode_inds=self.analyzed_barcode_inds,
@@ -618,6 +630,8 @@ class SingleCellRNACountsDataset:
                     write_matrix_to_cellranger_h5(
                         output_file=filtered_output_file,
                         gene_names=self.data['gene_names'],
+                        gene_ids=self.data['gene_ids'],
+                        feature_types=self.data['feature_type'],
                         barcodes=cell_barcodes,
                         inferred_count_matrix=inferred_count_matrix[cell_barcode_inds, :],
                         cell_barcode_inds=None,
@@ -727,7 +741,7 @@ def detect_cellranger_version_mtx(filedir: str) -> int:
 
     """
 
-    assert os.path.isdir(filedir), "The directory {filedir} is not accessible."
+    assert os.path.isdir(filedir), f"The directory {filedir} is not accessible."
 
     if os.path.isfile(os.path.join(filedir, 'features.tsv.gz')):
         return 3
@@ -770,6 +784,15 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
             in the list is the number of genomes in the dataset.  Each numpy
             array contains the string names of genes in the genome, which
             correspond to the columns in the out['matrix'].
+        out['gene_ids']: List of numpy arrays, where the number of elements
+             in the list is the number of genomes in the dataset.  Each numpy
+             array contains the string Ensembl ID of genes in the genome, which
+             also correspond to the columns in the out['matrix'].
+        out['feature_types']: List of numpy arrays, where the number of elements
+             in the list is the number of genomes in the dataset.  Each numpy
+             array contains the string feature types of genes (or possibly
+             antibody capture reads), which also correspond to the columns
+             in the out['matrix'].
 
     """
 
@@ -783,17 +806,19 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
     if cellranger_version == 3:
 
         matrix_file = os.path.join(filedir, 'matrix.mtx.gz')
-        gene_file = os.path.join(filedir, "features.tsv.gz")
-        barcode_file = os.path.join(filedir, "barcodes.tsv.gz")
+        gene_file = os.path.join(filedir, 'features.tsv.gz')
+        barcode_file = os.path.join(filedir, 'barcodes.tsv.gz')
 
         # Read in feature names.
         features = np.genfromtxt(fname=gene_file,
                                  delimiter="\t", skip_header=0,
-                                 dtype='<U50')
+                                 dtype='<U100')
 
-        # Restrict to gene expression only.
-        gene_info = features[features[:, 2] == 'Gene Expression']
-        gene_names = gene_info[:, 1].squeeze()  # second column
+        # Read in gene expression and feature data.
+        feature_types = features[:, 2].squeeze()  # third column
+        is_gene_expression = (feature_types == 'Gene Expression')
+        gene_names = features[:, 1].squeeze()  # second column
+        gene_ids = features[:, 0].squeeze()  # first column
 
     # CellRanger version 2
     elif cellranger_version == 2:
@@ -804,9 +829,15 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
         barcode_file = os.path.join(filedir, "barcodes.tsv")
 
         # Read in gene names.
-        gene_names = np.genfromtxt(fname=gene_file,
-                                   delimiter="\t", skip_header=0,
-                                   dtype='<U50')[:, 1].squeeze()  # second column
+        gene_data = np.genfromtxt(fname=gene_file,
+                                  delimiter="\t", skip_header=0,
+                                  dtype='<U100')
+        if len(gene_data.shape) == 1:
+            gene_names = gene_data.squeeze()
+        else:
+            gene_names = gene_data[:, 1].squeeze()  # second column
+            gene_ids = gene_data[:, 0].squeeze()  # first column
+        feature_types = None
 
     # For both versions:
 
@@ -829,6 +860,8 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
 
     return {'matrix': count_matrix,
             'gene_names': gene_names,
+            'feature_types': feature_types,
+            'gene_ids': gene_ids,
             'barcodes': barcodes}
 
 
@@ -889,6 +922,15 @@ def get_matrix_from_cellranger_h5(filename: str) \
             in the list is the number of genomes in the dataset.  Each numpy
             array contains the string names of genes in the genome, which
             correspond to the columns in the out['matrix'].
+        out['gene_ids']: List of numpy arrays, where the number of elements
+             in the list is the number of genomes in the dataset.  Each numpy
+             array contains the string Ensembl ID of genes in the genome, which
+             also correspond to the columns in the out['matrix'].
+        out['feature_types']: List of numpy arrays, where the number of elements
+             in the list is the number of genomes in the dataset.  Each numpy
+             array contains the string feature types of genes (or possibly
+             antibody capture reads), which also correspond to the columns
+             in the out['matrix'].
 
     """
 
@@ -899,6 +941,8 @@ def get_matrix_from_cellranger_h5(filename: str) \
     with tables.open_file(filename, 'r') as f:
         # Initialize empty lists.
         gene_names = []
+        gene_ids = []
+        feature_types = None
         csc_list = []
         barcodes = None
 
@@ -919,6 +963,7 @@ def get_matrix_from_cellranger_h5(filename: str) \
                     csc_list.append(sp.csc_matrix((data, indices, indptr),
                                                   shape=shape))
                     gene_names.extend(getattr(group, 'gene_names').read())
+                    gene_ids.extend(getattr(group, 'genes').read())
 
                 except tables.NoSuchNodeError:
                     # This exists to bypass the root node, which has no data.
@@ -940,17 +985,13 @@ def get_matrix_from_cellranger_h5(filename: str) \
 
             # Read in 'feature' information
             feature_group = f.get_node(f.root.matrix, 'features')
-            feature_types = getattr(feature_group,
-                                    'feature_type').read()
+            feature_types = getattr(feature_group, 'feature_type').read().astype(str)
             feature_names = getattr(feature_group, 'name').read()
+            feature_ids = getattr(feature_group, 'id').read()
 
-            # The only 'feature' we want is 'Gene Expression'
-            is_gene_expression = (feature_types == b'Gene Expression')
-            gene_names.extend(feature_names[is_gene_expression])
-
-            # Excise other 'features' from the count matrix
-            gene_feature_inds = np.where(is_gene_expression)[0]
-            csc_list[-1] = csc_list[-1][gene_feature_inds, :]
+            # Keep all 'features'
+            gene_names.extend(feature_names)
+            gene_ids.extend(feature_ids)
 
     # Put the data together (possibly from several genomes for v2 datasets).
     count_matrix = sp.vstack(csc_list, format='csc')
@@ -966,12 +1007,16 @@ def get_matrix_from_cellranger_h5(filename: str) \
 
     return {'matrix': count_matrix,
             'gene_names': np.array(gene_names),
+            'gene_ids': np.array(gene_ids),
+            'feature_types': feature_types,
             'barcodes': np.array(barcodes)}
 
 
 def write_matrix_to_cellranger_h5(
         output_file: str,
         gene_names: np.ndarray,
+        gene_ids: Union[np.ndarray, None],
+        feature_types: Union[np.ndarray, None],
         barcodes: np.ndarray,
         inferred_count_matrix: sp.csc.csc_matrix,
         cell_barcode_inds: Union[np.ndarray, None] = None,
@@ -989,6 +1034,8 @@ def write_matrix_to_cellranger_h5(
     Args:
         output_file: Path to output .h5 file (e.g., 'output.h5').
         gene_names: Name of each gene (column of count matrix).
+        gene_ids: Ensembl ID of each gene (column of count matrix).
+        feature_types: Type of each feature (column of count matrix).
         barcodes: Name of each barcode (row of count matrix).
         inferred_count_matrix: Count matrix to be written to file, in sparse
             format.  Rows are barcodes, columns are genes.
@@ -1020,6 +1067,14 @@ def write_matrix_to_cellranger_h5(
         "The number of gene names must match the number of columns in the " \
         "count matrix."
 
+    if gene_ids is not None:
+        assert gene_names.size == gene_ids.size, \
+            "The number of gene_names must match the number of gene_ids."
+
+    if feature_types is not None:
+        assert gene_names.size == feature_types.size, \
+            "The number of gene_names must match the number of feature_types."
+
     assert barcodes.size == inferred_count_matrix.shape[0], \
         "The number of barcodes must match the number of rows in the count" \
         "matrix."
@@ -1038,6 +1093,10 @@ def write_matrix_to_cellranger_h5(
 
             # Create arrays within that group for barcodes and gene_names.
             f.create_array(group, "gene_names", gene_names)
+            if gene_ids is not None:
+                f.create_array(group, "gene_ids", gene_ids)
+            if feature_types is not None:
+                f.create_array(group, "feature_types", feature_types)
             f.create_array(group, "barcodes", barcodes)
 
             # Create arrays to store the count data.
@@ -1240,7 +1299,7 @@ def estimate_chi_ambient_from_dataset(dataset: SingleCellRNACountsDataset) \
     count_matrix = dataset.get_count_matrix()
 
     # Empty droplets have log counts < log_crossover.
-    empty_barcodes = (np.log(np.array(count_matrix.sum(axis=1)).squeeze())
+    empty_barcodes = (np.log1p(np.array(count_matrix.sum(axis=1)).squeeze())
                       < log_crossover)
 
     # Sum gene expression for the empty droplets.

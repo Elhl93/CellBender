@@ -134,6 +134,11 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                                 "at high values of lambda.  You can specify "
                                 "multiple values, which will create multiple "
                                 "output files.")
+    subparser.add_argument("--exclude-antibody-capture",
+                           dest="exclude_antibodies", action="store_true",
+                           help="Including the flag --exclude-antibody-capture "
+                                "will cause remove-background to operate on "
+                                "gene counts only, ignoring other features.")
     subparser.add_argument("--learning-rate", nargs=None,
                            type=float, default=1e-3,
                            dest="learning_rate",

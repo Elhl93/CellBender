@@ -147,6 +147,7 @@ def run_remove_background(args):
                                        fraction_empties=args.fraction_empties,
                                        model_name=args.model,
                                        gene_blacklist=args.blacklisted_genes,
+                                       exclude_antibodies=args.exclude_antibodies,
                                        low_count_threshold=args.low_count_threshold,
                                        lambda_multiplier=args.lambda_multiplier)
 
