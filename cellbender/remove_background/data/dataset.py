@@ -962,7 +962,7 @@ def get_matrix_from_cellranger_h5(filename: str) \
         feature_types = None
         csc_list = []
         barcodes = None
-        genome = None
+        genomes = None
 
         # CellRanger v2:
         # Each group in the table (other than root) contains a genome,
