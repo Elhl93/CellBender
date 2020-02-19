@@ -548,7 +548,7 @@ class SingleCellRNACountsDataset:
         if self._detect_input_data_type() == 'cellranger_h5':
             cellranger_version = detect_cellranger_version_h5(self.input_file)
         else:
-            cellranger_version = 3
+            cellranger_version = detect_cellranger_version_mtx(self.input_file)
 
         # Write to output file, for each lambda specified by user.
         if len(self.lambda_multiplier) == 1:
@@ -847,10 +847,10 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
         gene_data = np.genfromtxt(fname=gene_file,
                                   delimiter="\t", skip_header=0,
                                   dtype='<U100')
-        if len(gene_data.shape) == 1:
+        if len(gene_data.shape) == 1:  # custom file format with just gene names
             gene_names = gene_data.squeeze()
             gene_ids = None
-        else:
+        else:  # the 10x CellRanger v2 format with two columns
             gene_names = gene_data[:, 1].squeeze()  # second column
             gene_ids = gene_data[:, 0].squeeze()  # first column
         feature_types = None
