@@ -223,6 +223,7 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
                         input_transform='normalize')
 
     encoder_other = EncodeNonZLatents(n_genes=count_matrix.shape[1],
+                                      z_dim=args.z_dim,
                                       # hidden_dims=[50, 10],  # TODO
                                       hidden_dims=[100, 50],  # TODO
                                       log_count_crossover=dataset_obj.priors['log_counts_crossover'],
