@@ -849,6 +849,7 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
                                   dtype='<U100')
         if len(gene_data.shape) == 1:
             gene_names = gene_data.squeeze()
+            gene_ids = None
         else:
             gene_names = gene_data[:, 1].squeeze()  # second column
             gene_ids = gene_data[:, 0].squeeze()  # first column
@@ -1000,7 +1001,7 @@ def get_matrix_from_cellranger_h5(filename: str) \
             csc_list.append(sp.csc_matrix((data, indices, indptr),
                                           shape=shape))
 
-            # Read in 'feature' information
+            # Read in 'feature' information  # TODO: could use a "try" for non-essentials
             feature_group = f.get_node(f.root.matrix, 'features')
             feature_types = getattr(feature_group, 'feature_type').read()
             feature_names = getattr(feature_group, 'name').read()

@@ -18,8 +18,6 @@ from cellbender.remove_background.distributions.NegativeBinomialPoissonConv \
 from cellbender.remove_background.distributions.NegativeBinomialPoissonConvApprox \
     import NegativeBinomialPoissonConvApprox as NBPCapprox
 from cellbender.remove_background.distributions.NullDist import NullDist
-from cellbender.remove_background.distributions.PoissonImportanceMarginalizedGamma \
-    import PoissonImportanceMarginalizedGamma
 from cellbender.remove_background.exceptions import NanException
 
 from typing import Union
