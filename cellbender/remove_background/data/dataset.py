@@ -184,8 +184,10 @@ class SingleCellRNACountsDataset:
         # (All barcodes must be included so that inference can generalize.)
         gene_counts_per_barcode = np.array(matrix.sum(axis=0)).squeeze()
         if self.exclude_antibodies:
-            antibody_logic = (self.data['feature_types'] == 'Antibody Capture')
+            antibody_logic = (self.data['feature_types'] == b'Antibody Capture')
             # Exclude these by setting their counts to zero
+            logging.info(f"Excluding {antibody_logic.sum()} features that "
+                         f"correspond to antibody capture.")
             gene_counts_per_barcode[antibody_logic] = 0
         nonzero_gene_counts = (gene_counts_per_barcode > 0)
         self.analyzed_gene_inds = np.where(nonzero_gene_counts)[0].astype(dtype=int)
@@ -542,13 +544,21 @@ class SingleCellRNACountsDataset:
             cell_barcode_inds = self.analyzed_barcode_inds
             filtered_inds_of_analyzed_barcodes = np.arange(0, d.size)
 
+        # CellRanger version (format output like input).
+        if self._detect_input_data_type() == 'cellranger_h5':
+            cellranger_version = detect_cellranger_version_h5(self.input_file)
+        else:
+            cellranger_version = 3
+
         # Write to output file, for each lambda specified by user.
         if len(self.lambda_multiplier) == 1:
             write_succeeded = write_matrix_to_cellranger_h5(
+                cellranger_version=cellranger_version,
                 output_file=output_file,
                 gene_names=self.data['gene_names'],
                 gene_ids=self.data['gene_ids'],
-                feature_types=self.data['feature_type'],
+                feature_types=self.data['feature_types'],
+                genomes=self.data['genomes'],
                 barcodes=self.data['barcodes'],
                 inferred_count_matrix=inferred_count_matrix,
                 cell_barcode_inds=cell_barcode_inds,
@@ -571,10 +581,12 @@ class SingleCellRNACountsDataset:
                 cell_barcodes = self.data['barcodes'][cell_barcode_inds]
 
                 write_matrix_to_cellranger_h5(
+                    cellranger_version=cellranger_version,
                     output_file=filtered_output_file,
                     gene_names=self.data['gene_names'],
                     gene_ids=self.data['gene_ids'],
-                    feature_types=self.data['feature_type'],
+                    feature_types=self.data['feature_types'],
+                    genomes=self.data['genomes'],
                     barcodes=cell_barcodes,
                     inferred_count_matrix=inferred_count_matrix[cell_barcode_inds, :],
                     cell_barcode_inds=None,
@@ -604,10 +616,12 @@ class SingleCellRNACountsDataset:
                 temp_output_filename = os.path.join(file_dir, file_name + f"_lambda_{lam_mult}.h5")
 
                 write_succeeded = write_matrix_to_cellranger_h5(
+                    cellranger_version=cellranger_version,
                     output_file=temp_output_filename,
                     gene_names=self.data['gene_names'],
                     gene_ids=self.data['gene_ids'],
-                    feature_types=self.data['feature_type'],
+                    feature_types=self.data['feature_types'],
+                    genomes=self.data['genomes'],
                     barcodes=self.data['barcodes'],
                     inferred_count_matrix=inferred_count_matrix,
                     cell_barcode_inds=self.analyzed_barcode_inds,
@@ -628,10 +642,12 @@ class SingleCellRNACountsDataset:
                     cell_barcodes = self.data['barcodes'][cell_barcode_inds]
 
                     write_matrix_to_cellranger_h5(
+                        cellranger_version=cellranger_version,
                         output_file=filtered_output_file,
                         gene_names=self.data['gene_names'],
                         gene_ids=self.data['gene_ids'],
-                        feature_types=self.data['feature_type'],
+                        feature_types=self.data['feature_types'],
+                        genomes=self.data['genomes'],
                         barcodes=cell_barcodes,
                         inferred_count_matrix=inferred_count_matrix[cell_barcode_inds, :],
                         cell_barcode_inds=None,
@@ -815,10 +831,9 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
                                  dtype='<U100')
 
         # Read in gene expression and feature data.
-        feature_types = features[:, 2].squeeze()  # third column
-        is_gene_expression = (feature_types == 'Gene Expression')
-        gene_names = features[:, 1].squeeze()  # second column
         gene_ids = features[:, 0].squeeze()  # first column
+        gene_names = features[:, 1].squeeze()  # second column
+        feature_types = features[:, 2].squeeze()  # third column
 
     # CellRanger version 2
     elif cellranger_version == 2:
@@ -862,6 +877,7 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
             'gene_names': gene_names,
             'feature_types': feature_types,
             'gene_ids': gene_ids,
+            'genomes': None,  # TODO: check if this info is available in either version
             'barcodes': barcodes}
 
 
@@ -945,6 +961,7 @@ def get_matrix_from_cellranger_h5(filename: str) \
         feature_types = None
         csc_list = []
         barcodes = None
+        genome = None
 
         # CellRanger v2:
         # Each group in the table (other than root) contains a genome,
@@ -985,9 +1002,10 @@ def get_matrix_from_cellranger_h5(filename: str) \
 
             # Read in 'feature' information
             feature_group = f.get_node(f.root.matrix, 'features')
-            feature_types = getattr(feature_group, 'feature_type').read().astype(str)
+            feature_types = getattr(feature_group, 'feature_type').read()
             feature_names = getattr(feature_group, 'name').read()
             feature_ids = getattr(feature_group, 'id').read()
+            genomes = getattr(feature_group, 'genome').read()
 
             # Keep all 'features'
             gene_names.extend(feature_names)
@@ -1008,17 +1026,20 @@ def get_matrix_from_cellranger_h5(filename: str) \
     return {'matrix': count_matrix,
             'gene_names': np.array(gene_names),
             'gene_ids': np.array(gene_ids),
-            'feature_types': feature_types,
+            'genomes': genomes,
+            'feature_types': np.array(feature_types),
             'barcodes': np.array(barcodes)}
 
 
 def write_matrix_to_cellranger_h5(
+        cellranger_version: int,
         output_file: str,
         gene_names: np.ndarray,
-        gene_ids: Union[np.ndarray, None],
-        feature_types: Union[np.ndarray, None],
         barcodes: np.ndarray,
         inferred_count_matrix: sp.csc.csc_matrix,
+        feature_types: Union[np.ndarray, None] = None,
+        gene_ids: Union[np.ndarray, None] = None,
+        genomes: Union[np.ndarray, None] = None,
         cell_barcode_inds: Union[np.ndarray, None] = None,
         ambient_expression: Union[np.ndarray, None] = None,
         rho: Union[np.ndarray, None] = None,
@@ -1032,9 +1053,12 @@ def write_matrix_to_cellranger_h5(
     """Write count matrix data to output HDF5 file using CellRanger format.
 
     Args:
+        cellranger_version: Either 2 or 3. Determines the format of the output
+            h5 file.
         output_file: Path to output .h5 file (e.g., 'output.h5').
         gene_names: Name of each gene (column of count matrix).
         gene_ids: Ensembl ID of each gene (column of count matrix).
+        genomes: Name of the genome that each gene comes from.
         feature_types: Type of each feature (column of count matrix).
         barcodes: Name of each barcode (row of count matrix).
         inferred_count_matrix: Count matrix to be written to file, in sparse
@@ -1075,6 +1099,10 @@ def write_matrix_to_cellranger_h5(
         assert gene_names.size == feature_types.size, \
             "The number of gene_names must match the number of feature_types."
 
+    if genomes is not None:
+        assert gene_names.size == genomes.size, \
+            "The number of gene_names must match the number of genome designations."
+
     assert barcodes.size == inferred_count_matrix.shape[0], \
         "The number of barcodes must match the number of rows in the count" \
         "matrix."
@@ -1085,18 +1113,49 @@ def write_matrix_to_cellranger_h5(
     # Write to output file.
     try:
         with tables.open_file(output_file, "w",
-                              title="Background-subtracted UMI counts") as f:
+                              title="CellBender remove-background output") as f:
 
-            # Create the group where data will be stored.
-            group = f.create_group("/", "background_removed",
-                                   "Counts after background correction")
+            if cellranger_version == 2:
 
-            # Create arrays within that group for barcodes and gene_names.
-            f.create_array(group, "gene_names", gene_names)
-            if gene_ids is not None:
-                f.create_array(group, "gene_ids", gene_ids)
-            if feature_types is not None:
-                f.create_array(group, "feature_types", feature_types)
+                # Create the group where data will be stored.
+                group = f.create_group("/", "background_removed",
+                                       "Counts after background correction")
+
+                # Create arrays within that group for gene info.
+                f.create_array(group, "gene_names", gene_names)
+                if gene_ids is not None:
+                    print(f'indeed writing gene_ids as {gene_ids}')
+                    f.create_array(group, "genes", gene_ids)
+
+            elif cellranger_version == 3:
+
+                # Create the group where data will be stored: name is "matrix".
+                group = f.create_group("/", "matrix",
+                                       "Counts after background correction")
+
+                # Create a sub-group called "features"
+                feature_group = f.create_group(group, "features",
+                                               "Genes and other features measured")
+
+                # Create arrays within that group for feature info.
+                f.create_array(feature_group, "name", gene_names)
+                if gene_ids is not None:
+                    f.create_array(feature_group, "id", gene_ids)
+                if feature_types is not None:
+                    f.create_array(feature_group, "feature_type", feature_types)
+                if genomes is not None:
+                    f.create_array(feature_group, "genome", genomes)
+
+                # Copy the other extraneous information from the input file.
+                # (Some user might need it for some reason.)
+                # TODO
+
+            else:
+                raise NotImplementedError(f'Trying to save to CellRanger '
+                                          f'v{cellranger_version} format, which '
+                                          f'is not implemented.')
+
+            # Code for both versions.
             f.create_array(group, "barcodes", barcodes)
 
             # Create arrays to store the count data.
@@ -1136,7 +1195,8 @@ def write_matrix_to_cellranger_h5(
                     f.create_array(group, "fraction_data_used_for_testing",
                                    1. - consts.TRAINING_FRACTION)
 
-        logging.info(f"Succeeded in writing output to file {output_file}")
+        logging.info(f"Succeeded in writing CellRanger v{cellranger_version} "
+                     f"format output to file {output_file}")
 
         return True
 
