@@ -307,14 +307,18 @@ class RemoveBackgroundPyroModel(nn.Module):
                                         y=y,
                                         rho=rho)
 
-            # Calculate the background rate parameter (for each barcode).
-            lam = self.calculate_lambda(epsilon=epsilon,
-                                        chi_ambient=chi_ambient,
-                                        d_empty=d_empty,
-                                        y=y,
-                                        d_cell=d_cell,
-                                        rho=rho,
-                                        chi_bar=self.avg_gene_expression)
+            if self.include_empties:
+
+                # Calculate the background rate parameter (for each barcode).
+                lam = self.calculate_lambda(epsilon=epsilon,
+                                            chi_ambient=chi_ambient,
+                                            d_empty=d_empty,
+                                            y=y,
+                                            d_cell=d_cell,
+                                            rho=rho,
+                                            chi_bar=self.avg_gene_expression)
+            else:
+                lam = torch.zeros([self.n_genes]).to(self.device)
 
             alpha = alpha0.unsqueeze(-1) * chi
 
@@ -347,17 +351,11 @@ class RemoveBackgroundPyroModel(nn.Module):
                 #                 obs=x.reshape(-1, self.n_genes))
 
             # Additionally use some high-count droplets for cell prob regularization.
-            counts = x.sum(dim=-1, keepdim=False)
             # surely_cell_mask = (torch.where(counts >= self.d_cell_loc_prior.exp(),
             #                                 torch.ones_like(counts),
             #                                 torch.zeros_like(counts))
             #                     .bool().to(self.device))
             # print(f'sure cells = {surely_cell_mask.sum()}')
-
-            p_logit_posterior = pyro.sample("p_passback",
-                                            NullDist(torch.zeros(1)
-                                                     .to(self.device))
-                                            .expand_by([x.size(0)]))
 
             # with poutine.mask(mask=surely_cell_mask):
             #
@@ -368,14 +366,15 @@ class RemoveBackgroundPyroModel(nn.Module):
             #                                 scale=1.),
             #                     obs=torch.ones_like(y) * 5.)
 
-            # Regularize based on wanting a balanced p_y_logit.
-            pyro.sample("p_logit_reg", dist.Normal(loc=self.p_logit_prior,
-                                                   scale=2. * torch.ones([1]).to(self.device)))
-
-            # Additionally use the surely empty droplets for regularization,
-            # since we know these droplets by their UMI counts.
             if self.include_empties:
 
+                # Put a prior on p_y_logit to maintain balance.
+                pyro.sample("p_logit_reg", dist.Normal(loc=self.p_logit_prior,
+                                                       scale=2. * torch.ones([1]).to(self.device)))
+
+                # Additionally use the surely empty droplets for regularization,
+                # since we know these droplets by their UMI counts.
+                counts = x.sum(dim=-1, keepdim=False)
                 surely_empty_mask = ((counts < self.empty_UMI_threshold)
                                      .bool().to(self.device))
 
@@ -410,6 +409,11 @@ class RemoveBackgroundPyroModel(nn.Module):
 
                     with poutine.scale(scale=1.0):
 
+                        p_logit_posterior = pyro.sample("p_passback",
+                                                        NullDist(torch.zeros(1)
+                                                                 .to(self.device))
+                                                        .expand_by([x.size(0)]))
+
                         # pyro.sample("obs_empty_y",
                         #             dist.Bernoulli(logits=p_logit_posterior),
                         #             obs=torch.zeros_like(y))
@@ -417,8 +421,6 @@ class RemoveBackgroundPyroModel(nn.Module):
                                     dist.Normal(loc=p_logit_posterior,
                                                 scale=1.),
                                     obs=torch.ones_like(y) * -5.)  # TODO: try -10
-
-
 
         return {'mu': mu_cell, 'lam': lam, 'alpha': alpha, 'counts': c}
 
@@ -551,7 +553,7 @@ class RemoveBackgroundPyroModel(nn.Module):
             else:
 
                 # Sample d based on the encoding.
-                pyro.sample("d_cell", dist.LogNormal(log=enc['d_loc'],
+                pyro.sample("d_cell", dist.LogNormal(loc=enc['d_loc'],
                                                      scale=d_cell_scale))
 
                 # Sample latent code z for each cell.
@@ -571,6 +573,9 @@ class RemoveBackgroundPyroModel(nn.Module):
         """
 
         if params is None:
+            return
+
+        if not self.include_empties:
             return
 
         # trace the guide

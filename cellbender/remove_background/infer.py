@@ -82,8 +82,12 @@ class Posterior(ABC):
 
         for i, data in enumerate(data_loader):
 
-            enc = self.vi_model.encoder.forward(x=data,
-                                                chi_ambient=pyro.param('chi_ambient').detach())
+            if 'chi_ambient' in pyro.get_param_store().keys():
+                chi_ambient = pyro.param('chi_ambient').detach()
+            else:
+                chi_ambient = None
+
+            enc = self.vi_model.encoder.forward(x=data, chi_ambient=chi_ambient)
             ind = i * data_loader.batch_size
             z[ind:(ind + data.shape[0]), :] = enc['z']['loc'].detach().cpu().numpy()
             d[ind:(ind + data.shape[0])] = \
