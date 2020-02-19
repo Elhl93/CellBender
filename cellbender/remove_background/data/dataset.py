@@ -855,6 +855,10 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
             gene_ids = gene_data[:, 0].squeeze()  # first column
         feature_types = None
 
+    else:
+        raise NotImplementedError('MTX format was not identifiable as CellRanger '
+                                  'v2 or v3.  Please check 10x Genomics formatting.')
+
     # For both versions:
 
     # Read in sparse count matrix.
@@ -957,17 +961,19 @@ def get_matrix_from_cellranger_h5(filename: str) \
 
     with tables.open_file(filename, 'r') as f:
         # Initialize empty lists.
-        gene_names = []
-        gene_ids = []
-        feature_types = None
         csc_list = []
         barcodes = None
+        feature_ids = None
+        feature_types = None
         genomes = None
 
         # CellRanger v2:
         # Each group in the table (other than root) contains a genome,
         # so walk through the groups to get data for each genome.
         if cellranger_version == 2:
+
+            feature_names = []
+            feature_ids = []
 
             for group in f.walk_groups():
                 try:
@@ -980,12 +986,19 @@ def get_matrix_from_cellranger_h5(filename: str) \
                     shape = getattr(group, 'shape').read()
                     csc_list.append(sp.csc_matrix((data, indices, indptr),
                                                   shape=shape))
-                    gene_names.extend(getattr(group, 'gene_names').read())
-                    gene_ids.extend(getattr(group, 'genes').read())
+                    feature_names.extend(getattr(group, 'gene_names').read())
+                    feature_ids.extend(getattr(group, 'genes').read())
 
                 except tables.NoSuchNodeError:
                     # This exists to bypass the root node, which has no data.
                     pass
+
+            # Create numpy arrays.
+            feature_names = np.array(feature_names)
+            if len(feature_ids) > 0:
+                feature_ids = np.array(feature_ids)
+            else:
+                feature_ids = None
 
         # CellRanger v3:
         # There is only the 'matrix' group.
@@ -1001,35 +1014,46 @@ def get_matrix_from_cellranger_h5(filename: str) \
             csc_list.append(sp.csc_matrix((data, indices, indptr),
                                           shape=shape))
 
-            # Read in 'feature' information  # TODO: could use a "try" for non-essentials
+            # Read in 'feature' information
             feature_group = f.get_node(f.root.matrix, 'features')
-            feature_types = getattr(feature_group, 'feature_type').read()
             feature_names = getattr(feature_group, 'name').read()
-            feature_ids = getattr(feature_group, 'id').read()
-            genomes = getattr(feature_group, 'genome').read()
 
-            # Keep all 'features'
-            gene_names.extend(feature_names)
-            gene_ids.extend(feature_ids)
+            try:
+                feature_types = getattr(feature_group, 'feature_type').read()
+            except tables.NoSuchNodeError:
+                # This exists in case someone produced a file without feature_type.
+                pass
+            try:
+                feature_ids = getattr(feature_group, 'id').read()
+            except tables.NoSuchNodeError:
+                # This exists in case someone produced a file without feature id.
+                pass
+            try:
+                genomes = getattr(feature_group, 'genome').read()
+            except tables.NoSuchNodeError:
+                # This exists in case someone produced a file without feature genome.
+                pass
 
     # Put the data together (possibly from several genomes for v2 datasets).
     count_matrix = sp.vstack(csc_list, format='csc')
     count_matrix = count_matrix.transpose().tocsr()
 
     # Issue warnings if necessary, based on dimensions matching.
-    if count_matrix.shape[1] != len(gene_names):
-        logging.warning(f"Number of gene names in {filename} does not match "
-                        f"the number expected from the count matrix.")
-    if count_matrix.shape[0] != len(barcodes):
-        logging.warning(f"Number of barcodes in {filename} does not match "
-                        f"the number expected from the count matrix.")
+    if count_matrix.shape[1] != feature_names.size:
+        logging.warning(f"Number of gene names ({feature_names.size}) in {filename} "
+                        f"does not match the number expected from the count "
+                        f"matrix ({count_matrix.shape[1]}).")
+    if count_matrix.shape[0] != barcodes.size:
+        logging.warning(f"Number of barcodes ({barcodes.size}) in {filename} "
+                        f"does not match the number expected from the count "
+                        f"matrix ({count_matrix.shape[0]}).")
 
     return {'matrix': count_matrix,
-            'gene_names': np.array(gene_names),
-            'gene_ids': np.array(gene_ids),
+            'gene_names': feature_names,
+            'gene_ids': feature_ids,
             'genomes': genomes,
-            'feature_types': np.array(feature_types),
-            'barcodes': np.array(barcodes)}
+            'feature_types': feature_types,
+            'barcodes': barcodes}
 
 
 def write_matrix_to_cellranger_h5(
@@ -1094,11 +1118,13 @@ def write_matrix_to_cellranger_h5(
 
     if gene_ids is not None:
         assert gene_names.size == gene_ids.size, \
-            "The number of gene_names must match the number of gene_ids."
+            f"The number of gene_names {gene_names.shape} must match " \
+            f"the number of gene_ids {gene_ids.shape}."
 
     if feature_types is not None:
         assert gene_names.size == feature_types.size, \
-            "The number of gene_names must match the number of feature_types."
+            f"The number of gene_names {gene_names.shape} must match " \
+            f"the number of feature_types {feature_types.shape}."
 
     if genomes is not None:
         assert gene_names.size == genomes.size, \
