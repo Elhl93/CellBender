@@ -46,8 +46,8 @@ class RemoveBackgroundPyroModel(nn.Module):
                  encoder: Union[nn.Module, encoder_module.CompositeEncoder],
                  decoder: nn.Module,
                  dataset_obj: 'SingleCellRNACountsDataset',
-                 rho_alpha_prior: float = 1.5,
-                 rho_beta_prior: float = 20,
+                 rho_alpha_prior: float = consts.RHO_ALPHA_PRIOR,
+                 rho_beta_prior: float = consts.RHO_BETA_PRIOR,
                  use_cuda: bool = False):
         super(RemoveBackgroundPyroModel, self).__init__()
 
@@ -90,18 +90,19 @@ class RemoveBackgroundPyroModel(nn.Module):
             f"Issue with prior: cell_counts is " \
             f"{dataset_obj.priors['cell_counts']}, but should be > 0."
 
-        self.d_cell_loc_prior = (np.log1p(dataset_obj.priors['cell_counts'],
-                                          dtype=np.float32).item()
-                                 * torch.ones(torch.Size([])).to(self.device))
+        self.d_cell_loc_prior = torch.tensor(np.log1p(dataset_obj.priors['cell_counts']))\
+            .float().to(self.device)
+        print(f'self.d_cell_loc_prior is {self.d_cell_loc_prior} which has exp {self.d_cell_loc_prior.exp()}')
+
         # TODO:
-        self.d_cell_scale_prior = (torch.tensor(0.2).to(self.device))
+        self.d_cell_scale_prior = (torch.tensor(0.01).to(self.device))
                                    #np.array(dataset_obj.priors['d_std'],
                                             # dtype=np.float32).item()
                                    # * torch.ones(torch.Size([])).to(self.device))
         self.z_loc_prior = torch.zeros(torch.Size([self.z_dim])).to(self.device)
         self.z_scale_prior = torch.ones(torch.Size([self.z_dim]))\
             .to(self.device)
-        self.epsilon_prior = torch.tensor(1000.).to(self.device)
+        self.epsilon_prior = torch.tensor(consts.EPSILON_PRIOR).to(self.device)
         self.alpha0_loc_prior = (torch.tensor(consts.ALPHA0_PRIOR_LOC)
                                  .float().to(self.device))
         self.alpha0_scale_prior = (torch.tensor(consts.ALPHA0_PRIOR_SCALE)
@@ -169,16 +170,22 @@ class RemoveBackgroundPyroModel(nn.Module):
             lam = epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1) * chi_ambient
 
         elif self.model_type == "swapping":
-            lam = (rho.unsqueeze(-1) * y.unsqueeze(-1)
-                   * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
-                   + d_empty.unsqueeze(-1)) * chi_bar
+            # lam = (rho.unsqueeze(-1) * y.unsqueeze(-1)
+            #        * epsilon.unsqueeze(-1) * d_cell.unsqueeze(-1)
+            #        + d_empty.unsqueeze(-1)) * chi_bar
+            lam = (rho.unsqueeze(-1) * y.unsqueeze(-1) * d_cell.unsqueeze(-1)
+                   + d_empty.unsqueeze(-1)) * chi_bar * epsilon.unsqueeze(-1)
 
         elif self.model_type == "full":
-            lam = ((1. - rho.unsqueeze(-1))
-                   * epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1) * chi_ambient
-                   + rho.unsqueeze(-1) *
-                   (y.unsqueeze(-1) * d_cell.unsqueeze(-1)
-                    + d_empty.unsqueeze(-1)) * chi_bar)
+            # lam = ((1. - rho.unsqueeze(-1))
+            #        * epsilon.unsqueeze(-1) * d_empty.unsqueeze(-1) * chi_ambient
+            #        + rho.unsqueeze(-1) *
+            #        (y.unsqueeze(-1) * d_cell.unsqueeze(-1)
+            #         + d_empty.unsqueeze(-1)) * chi_bar)  # TODO: epsilon should multiply all terms
+            lam = (epsilon.unsqueeze(-1)
+                   * ((1. - rho.unsqueeze(-1)) * chi_ambient * d_empty.unsqueeze(-1)
+                   + rho.unsqueeze(-1) * chi_bar * (y.unsqueeze(-1) * d_cell.unsqueeze(-1)
+                                                    + d_empty.unsqueeze(-1))))
         else:
             raise NotImplementedError(f"model_type was set to {self.model_type}, "
                                       f"which is not implemented.")
@@ -257,28 +264,28 @@ class RemoveBackgroundPyroModel(nn.Module):
                                                 scale=self.alpha0_scale_prior)
                                  .expand_by([x.size(0)]))
 
+            # TODO: playing with D versus EPSILON
             # Sample d_cell based on priors.
             d_cell = pyro.sample("d_cell",
                                  dist.LogNormal(loc=self.d_cell_loc_prior,
                                                 scale=self.d_cell_scale_prior)
                                  .expand_by([x.size(0)]))
 
-            # TODO: changed rho from a latent to a hyperparameter
             # Sample swapping fraction rho.
             if self.include_rho:
                 rho = pyro.sample("rho", dist.Beta(self.rho_alpha_prior,
                                                    self.rho_beta_prior)
                                   .expand_by([x.size(0)]))
-                # rho = torch.clamp(rho_alpha, min=1e-5, max=0.9)
             else:
                 rho = None
 
+            # TODO: reinstated epsilon
             # Sample epsilon based on priors.
-            epsilon = torch.ones_like(alpha0).clone()  # TODO
-            # epsilon = pyro.sample("epsilon",
-            #                       dist.Gamma(concentration=self.epsilon_prior,
-            #                                  rate=self.epsilon_prior)
-            #                       .expand_by([x.size(0)]))
+            # epsilon = torch.ones_like(alpha0).clone()  # TODO
+            epsilon = pyro.sample("epsilon",
+                                  dist.Gamma(concentration=self.epsilon_prior,
+                                             rate=self.epsilon_prior)
+                                  .expand_by([x.size(0)]))
 
             # If modelling empty droplets:
             if self.include_empties:
@@ -348,22 +355,6 @@ class RemoveBackgroundPyroModel(nn.Module):
                 #                                                    n_samples=10).to_event(1),
                 #                 obs=x.reshape(-1, self.n_genes))
 
-            # Additionally use some high-count droplets for cell prob regularization.
-            # surely_cell_mask = (torch.where(counts >= self.d_cell_loc_prior.exp(),
-            #                                 torch.ones_like(counts),
-            #                                 torch.zeros_like(counts))
-            #                     .bool().to(self.device))
-            # print(f'sure cells = {surely_cell_mask.sum()}')
-
-            # with poutine.mask(mask=surely_cell_mask):
-            #
-            #     with poutine.scale(scale=0.1):
-            #
-            #         pyro.sample("obs_cell_y",
-            #                     dist.Normal(loc=p_logit_posterior,
-            #                                 scale=1.),
-            #                     obs=torch.ones_like(y) * 5.)
-
             if self.include_empties:
 
                 # Put a prior on p_y_logit to maintain balance.
@@ -420,6 +411,20 @@ class RemoveBackgroundPyroModel(nn.Module):
                                                 scale=1.),
                                     obs=torch.ones_like(y) * -5.)  # TODO: try -10
 
+                # Additionally use some high-count droplets for cell prob regularization.
+                surely_cell_mask = (torch.where(counts >= self.d_cell_loc_prior.exp(),
+                                                torch.ones_like(counts),
+                                                torch.zeros_like(counts))
+                                    .bool().to(self.device))
+                # print(f'sure cells = {surely_cell_mask.sum()}')
+
+                with poutine.mask(mask=surely_cell_mask):
+                    with poutine.scale(scale=10.0):
+                        pyro.sample("obs_cell_y",
+                                    dist.Normal(loc=p_logit_posterior,
+                                                scale=1.),
+                                    obs=torch.ones_like(y) * 5.)
+
         return {'mu': mu_cell, 'lam': lam, 'alpha': alpha, 'counts': c}
 
     @config_enumerate(default='parallel')
@@ -444,8 +449,9 @@ class RemoveBackgroundPyroModel(nn.Module):
 
         # Initialize variational parameters for d_cell.
         d_cell_scale = pyro.param("d_cell_scale",
-                                  self.d_cell_scale_prior *
-                                  torch.ones(torch.Size([])).to(self.device),
+                                  torch.tensor([0.02]).to(self.device),  # TODO
+                                  # self.d_cell_scale_prior *
+                                  # torch.ones(torch.Size([])).to(self.device),
                                   constraint=constraints.positive)
 
         # # Initialize variational parameters for alpha0.
@@ -454,6 +460,10 @@ class RemoveBackgroundPyroModel(nn.Module):
                                   constraint=constraints.positive)
 
         if self.include_empties:
+
+            # TODO: fixed value for d_empty_loc
+            # d_empty_loc = self.d_empty_loc_prior
+            # d_empty_scale = self.d_empty_scale_prior
 
             # Initialize variational parameters for d_empty.
             d_empty_loc = pyro.param("d_empty_loc",
@@ -472,7 +482,6 @@ class RemoveBackgroundPyroModel(nn.Module):
                                      torch.ones(torch.Size([])).to(self.device),
                                      constraint=constraints.simplex)
 
-        # TODO: rho as a hyperparameter
         # Initialize variational parameters for rho.
         if self.include_rho:
             rho_alpha = pyro.param("rho_alpha",
@@ -488,10 +497,8 @@ class RemoveBackgroundPyroModel(nn.Module):
         with pyro.plate("data", x.size(0),
                         use_cuda=self.use_cuda, device=self.device):
 
-            # TODO: changed rho from a latent to a hyperparameter
             # Sample swapping fraction rho.
             if self.include_rho:
-                # print(f'rho_alpha ise {rho_alpha}; rho_beta is {rho_beta}')
                 rho = pyro.sample("rho", dist.Beta(rho_alpha,
                                                    rho_beta).expand_by([x.size(0)]))
 
@@ -521,6 +528,15 @@ class RemoveBackgroundPyroModel(nn.Module):
                 # Sample the Bernoulli y from encoded p(y).
                 y = pyro.sample("y", dist.Bernoulli(logits=enc['p_y']))
 
+                # Gate d_cell_loc so empty droplets do not give big gradients.
+                prob = enc['p_y'].sigmoid()  # Logits to probability
+                d_cell_loc_gated = (prob * enc['d_loc'] + (1 - prob)
+                                    * self.d_cell_loc_prior)  # NOTE: necessary to pass on sim6
+
+                # Sample d based on the encoding.
+                d_cell = pyro.sample("d_cell", dist.LogNormal(loc=d_cell_loc_gated,
+                                                              scale=d_cell_scale))
+
                 # Mask out empty droplets.
                 with poutine.mask(mask=y.bool()):
 
@@ -535,18 +551,15 @@ class RemoveBackgroundPyroModel(nn.Module):
                                 dist.LogNormal(loc=enc['alpha0'],
                                                scale=alpha0_scale))
 
-                    # epsilon = pyro.sample("epsilon",
-                    #                       dist.Gamma(enc['epsilon'] * self.epsilon_prior,
-                    #                                  self.epsilon_prior))  # TODO
+                    # TODO: playing with D versus EPSILON
 
-                # Gate d_cell_loc so empty droplets do not give big gradients.
-                prob = enc['p_y'].sigmoid()  # Logits to probability
-                d_cell_loc_gated = (prob * enc['d_loc'] + (1 - prob)
-                                    * self.d_cell_loc_prior)
+                    # TODO: new encoding of d_loc from z only
 
-                # Sample d based on the encoding.
-                pyro.sample("d_cell", dist.LogNormal(loc=d_cell_loc_gated,
-                                                     scale=d_cell_scale))
+                    epsilon_gated = (prob * enc['epsilon'] + (1 - prob) * 1.)
+
+                    epsilon = pyro.sample("epsilon",
+                                          dist.Gamma(epsilon_gated * self.epsilon_prior,
+                                                     self.epsilon_prior))  # TODO
 
             else:
 

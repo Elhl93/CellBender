@@ -87,18 +87,39 @@ class Posterior(ABC):
             else:
                 chi_ambient = None
 
+            # # TODO: can I trace the model and grab the params to prevent discrepancies
+            # # TODO: here when I change the model?
+            # # Use pyro poutine to trace the guide.
+            # guide_trace = pyro.poutine.trace(self.vi_model.guide).get_trace(x=data)
+            #
+            # latent_dict = {}
+            #
+            # for node, key in guide_trace.nodes.items():
+            #     if (key == '_INPUT') or (key == '_RETURN'):
+            #         continue
+            #     latent_dict[key] = node['value']
+            #     # TODO: my issue is that this is a sample, and only for latents
+            #     # TODO: in the guide that are sampled: like p_y is not one, strictly
+
             enc = self.vi_model.encoder.forward(x=data, chi_ambient=chi_ambient)
             ind = i * data_loader.batch_size
             z[ind:(ind + data.shape[0]), :] = enc['z']['loc'].detach().cpu().numpy()
+
+            # d[ind:(ind + data.shape[0])] = \
+            #     dist.LogNormal(loc=self.vi_model.d_cell_loc_prior,
+            #                    scale=self.vi_model.d_cell_scale_prior).mean.detach().cpu().numpy()
             d[ind:(ind + data.shape[0])] = \
                 dist.LogNormal(loc=enc['d_loc'],
-                               scale=pyro.param('d_cell_scale')).mean.detach().cpu().numpy()
+                               scale=pyro.param('d_cell_scale')).mean.detach().cpu().numpy()  # TODO
+
             p[ind:(ind + data.shape[0])] = enc['p_y'].sigmoid().detach().cpu().numpy()
             alpha0[ind:(ind + data.shape[0])] = \
                 dist.LogNormal(loc=enc['alpha0'],
                                scale=pyro.param('alpha0_scale')).mean.detach().cpu().numpy()
-            # epsilon[ind:(ind + data.shape[0])] = enc['epsilon'].detach().cpu().numpy()
-            epsilon[ind:(ind + data.shape[0])] = torch.ones_like(enc['alpha0']).detach().cpu().numpy()  # TODO
+
+            epsilon[ind:(ind + data.shape[0])] = dist.Gamma(enc['epsilon'] * self.vi_model.epsilon_prior,
+                                                            self.vi_model.epsilon_prior).mean.detach().cpu().numpy()
+            # epsilon[ind:(ind + data.shape[0])] = torch.ones_like(enc['alpha0']).detach().cpu().numpy()  # TODO
 
         self._latents = {'z': z, 'd': d, 'p': p, 'alpha0': alpha0, 'epsilon': epsilon}
 

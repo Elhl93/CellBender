@@ -39,6 +39,10 @@ class CompositeEncoder(dict):
         # For each other module in the dict of the composite encoder,
         # call forward(), and pass in the encoded z.
         for key, value in self.module_dict.items():
+
+            if key == 'z':
+                continue  # already done
+
             out[key] = value.forward(**kwargs, z=out['z']['loc'].detach())
 
             # TODO: tidy up
@@ -468,6 +472,7 @@ class EncodeNonZLatents(nn.Module):
 
         # Values related to epsilon
         self.EPS_OUTPUT_SCALE = 0.05
+        self.EPS_OUTPUT_MEAN = 1.
 
         # Set up the linear transformations used in fully-connected layers.
         # Adjust initialization conditions to start with a reasonable output.
@@ -518,7 +523,7 @@ class EncodeNonZLatents(nn.Module):
                 x: torch.Tensor,
                 chi_ambient: Union[None, torch.Tensor],
                 z: torch.Tensor,
-                **kwargs) -> torch.Tensor:
+                **kwargs) -> Dict[str, torch.Tensor]:
         # Define the forward computation to go from gene expression to cell
         # probabilities.  The log of the total UMI counts is concatenated with
         # the input gene expression and the estimate of the difference between
@@ -633,6 +638,8 @@ class EncodeNonZLatents(nn.Module):
         alpha0 = torch.clamp(self.softplus((out[:, 3] - self.offset['alpha0'])
                                            + consts.ALPHA0_PRIOR_LOC),
                              max=50.).squeeze()  # prevent overflow: exp(50) < max(float)
+        epsilon = self.softplus((out[:, 2] - self.offset['epsilon']).squeeze()
+                                * self.EPS_OUTPUT_SCALE + self.EPS_OUTPUT_MEAN)
 
         # Feed z back in to the last layer of p_y_logit.  # TODO: try?
         # TODO: try clipping outputs to safe ranges (to prevent nans / overflow)
@@ -642,11 +649,99 @@ class EncodeNonZLatents(nn.Module):
                                        + self.softplus(log_sum.squeeze()
                                                        - self.log_count_crossover)
                                        + self.log_count_crossover).squeeze(),
-                'epsilon': ((out[:, 2] - self.offset['epsilon']).squeeze()
-                            * self.EPS_OUTPUT_SCALE + 1.),
+                'epsilon': epsilon,
                 'alpha0': alpha0}
         # NOTE: if alpha0 initialization is too small, there is not enough difference
         # between NB and Poisson, and y reverts to zero.
+
+
+class EncodeDfromZ(nn.Module):
+    """Encoder module that transforms latent gene expression into latent cell size.
+
+    The number of input units is the total number of genes and the number of
+    output units is the dimension of the latent space.  This encoder transforms
+    a point in high-dimensional gene expression space to a latent cell size
+    estimate, via a learned transformation involving fully-connected
+    layers.
+
+    Args:
+        input_dim: Number of genes.  The size of the input of this encoder.
+        hidden_dims: Size of each of the hidden layers.
+        output_dim: Number of dimensions of the size estimate (1).
+        initial_mean: The log of the mean number of counts in all cells.
+
+    Attributes:
+        initial_mean: The log of the mean number of counts in all cells.
+        linears: torch.nn.ModuleList of fully-connected layers before the
+            output layer.
+        output: torch.nn.Linear fully-connected output layer for the size
+            of each input barcode.
+        input_dim: Size of input latent gene expression, z.
+
+    Note:
+        An encoder with two hidden layers with sizes 100 and 500, respectively,
+        should set hidden_dims = [100, 500].  An encoder with only one hidden
+        layer should still pass in hidden_dims as a list, for example,
+        hidden_dims = [500].
+        This encoder acts as if each barcode input contains a cell.  In reality,
+        barcodes that do not contain a cell will not propagate gradients back
+        to this encoder, due to the design of the rest of the model.
+
+    """
+
+    def __init__(self,
+                 input_dim: int,
+                 hidden_dims: List[int],
+                 initial_log_mean: float,
+                 largest_empty_count_log: float,
+                 largest_cell_count_log: float,
+                 output_dim: int = 1):
+        super(EncodeDfromZ, self).__init__()
+        self.input_dim = input_dim
+        self.initial_log_mean = initial_log_mean
+        self.largest_cell_count_log = largest_cell_count_log
+        self.largest_empty_count_log = largest_empty_count_log
+
+        # Set up the linear transformations used in fully-connected layers.
+        self.linears = nn.ModuleList([nn.Linear(input_dim, hidden_dims[0])])
+        for i in range(1, len(hidden_dims)):  # Second hidden layer onward
+            self.linears.append(nn.Linear(hidden_dims[i-1], hidden_dims[i]))
+        self.output = nn.Linear(hidden_dims[-1], output_dim)
+
+        # Set up the non-linear activations.
+        self.softplus = nn.Softplus()
+
+        # Set up initial offset and scale.
+        self.offset = None
+        self.scale = None
+
+    def forward(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+        # Define the forward computation to go from gene expression to cell
+        # probabilities.
+
+        # Compute the hidden layers and the output.
+        hidden = self.softplus(self.linears[0](z))
+        for i in range(1, len(self.linears)):  # Second hidden layer onward
+            hidden = self.softplus(self.linears[i](hidden))
+
+        out = self.output(hidden)
+
+        if (self.offset is None) or (self.scale is None):
+            # First initialization only.
+            self.offset = out.mean()
+            self.scale = out.std() * 1000.  # Keep the initial output std ~ 0.001
+
+        out_scaled = (out - self.offset) / self.scale + self.initial_log_mean
+        # print(f'initial_log_mean = {self.initial_log_mean}')
+        # print(f'out_scaled.min() = {out_scaled.min()}')
+        # print(f'out_scaled.mean() = {out_scaled.mean()}')
+        # print(f'out_scaled.median() = {out_scaled.median()}')
+        # print(f'out_scaled.max() = {out_scaled.max()}')
+        # print(f'out_scaled.std() = {out_scaled.std()}')
+
+        return torch.clamp(self.softplus(out_scaled).squeeze(),
+                           min=1., #self.largest_empty_count_log,
+                           max=12.) #self.largest_cell_count_log)
 
 
 def transform_input(x: torch.Tensor, transform: str) -> Union[torch.Tensor,

@@ -328,6 +328,9 @@ class SingleCellRNACountsDataset:
             self.empty_UMI_threshold = (umi_counts[umi_count_order]
                                         [last_analyzed_bc])
 
+            # Find the max UMI count for any cell.
+            self.max_UMI_count = umi_counts.max()
+
             logging.info(f"Using {cell_barcodes.size} probable cell "
                          f"barcodes, plus an additional "
                          f"{transition_barcodes.size} barcodes, "

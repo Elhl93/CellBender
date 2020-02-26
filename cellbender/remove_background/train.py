@@ -10,7 +10,7 @@ from pyro.util import ignore_jit_warnings
 from cellbender.remove_background.model import RemoveBackgroundPyroModel
 from cellbender.remove_background.vae.decoder import Decoder
 from cellbender.remove_background.vae.encoder \
-    import EncodeZ, CompositeEncoder, EncodeNonZLatents
+    import EncodeZ, CompositeEncoder, EncodeNonZLatents, EncodeDfromZ
 from cellbender.remove_background.data.dataset import SingleCellRNACountsDataset
 from cellbender.remove_background.data.dataprep import \
     prep_sparse_data_for_training as prep_data_for_training
@@ -229,15 +229,21 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
                                       log_count_crossover=dataset_obj.priors['log_counts_crossover'],
                                       input_transform='normalize')
 
+    # encoder_d = EncodeDfromZ(input_dim=args.z_dim,
+    #                          hidden_dims=[10],
+    #                          initial_log_mean=np.log1p(dataset_obj.priors['cell_counts']).item(),
+    #                          largest_cell_count_log=np.log1p(dataset_obj.max_UMI_count),
+    #                          largest_empty_count_log=np.log1p(dataset_obj.empty_UMI_threshold),
+    #                          output_dim=1)
+
     encoder = CompositeEncoder({'z': encoder_z,
+                                # 'd_loc': encoder_d,
                                 'other': encoder_other})
 
     # Decoder.
     decoder = Decoder(input_dim=args.z_dim,
                       hidden_dims=args.z_hidden_dims[::-1],
-                      output_dim=count_matrix.shape[1],
-                      prior_cell_counts=dataset_obj.priors['cell_counts'],
-                      prior_empty_counts=dataset_obj.priors['empty_counts'])
+                      output_dim=count_matrix.shape[1])
 
     # Set up the pyro model for variational inference.
     model = RemoveBackgroundPyroModel(model_type=args.model,

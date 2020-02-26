@@ -32,3 +32,10 @@ FRACTION_EMPTIES = 0.5
 # Prior mean and std in log space for alpha0, the Dirichlet precision for cells.
 ALPHA0_PRIOR_LOC = 7.
 ALPHA0_PRIOR_SCALE = 2.
+
+# Prior on rho, the swapping fraction: the two concentration parameters alpha and beta.
+RHO_ALPHA_PRIOR = 18.  # 1.5
+RHO_BETA_PRIOR = 200.  # 20.
+
+# Prior on epsilon, the RT efficiency concentration parameter [Gamma(alpha, alpha)].
+EPSILON_PRIOR = 20.  # 1000.

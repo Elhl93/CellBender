@@ -40,14 +40,10 @@ class Decoder(nn.Module):
                  input_dim: int,
                  hidden_dims: List[int],
                  output_dim: int,
-                 prior_cell_counts: int,
-                 prior_empty_counts: int,
                  log_output: bool = False):
         super(Decoder, self).__init__()
         self.input_dim = input_dim
         self.log_output = log_output
-        self.prior_cell_counts = prior_cell_counts
-        self.prior_empty_counts = prior_empty_counts
 
         # Set up the linear transformations used in fully-connected layers.
         self.linears = nn.ModuleList([nn.Linear(input_dim, hidden_dims[0])])

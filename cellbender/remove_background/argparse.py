@@ -140,7 +140,7 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                                 "will cause remove-background to operate on "
                                 "gene counts only, ignoring other features.")
     subparser.add_argument("--learning-rate", nargs=None,
-                           type=float, default=1e-3,
+                           type=float, default=5e-4,
                            dest="learning_rate",
                            help="Training detail: learning rate for "
                                 "inference (probably "
